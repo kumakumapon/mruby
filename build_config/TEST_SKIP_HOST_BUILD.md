@@ -1,267 +1,128 @@
-# Testing Skip Host Build Configuration
+# Testing: Skip the 'host' Build Entirely
 
-## Overview
+This is the verified test procedure for `build_config/skip_host_build.rb`.
+See `SKIP_HOST_BUILD_ANALYSIS.md` for why the mechanism must be applied to
+a `MRuby::CrossBuild` and never combined with `MRuby::Build.new` in the
+same config -- combining the two does **not** skip the host build (that
+was an error in an earlier version of these docs, corrected here).
 
-This guide provides step-by-step instructions to verify that the `conf.mrbcfile` mechanism correctly skips the host build.
+## Prerequisites
 
-## Test Setup
+- A pre-built, host-native `mrbc` executable, copied outside `build/`
+  (e.g. from a prior plain `rake` run: `build/host/mrbc/bin/mrbc`).
+- Ruby >= 2.5, a C compiler, standard build tools.
 
-### Prerequisites
+## Step 1: Produce an external mrbc once
 
-- mruby source repository
-- Ruby >= 2.5
-- C compiler (gcc or clang)
-- Standard build tools (make, ar, etc.)
-
-### Preparation
-
-1. **Clean build to establish baseline:**
-   ```bash
-   rake clean
-   rake all
-   ```
-   This creates `build/host/mrbc/bin/mrbc` which will be used as the external mrbc.
-
-2. **Verify mrbc exists:**
-   ```bash
-   ls -la build/host/mrbc/bin/mrbc
-   file build/host/mrbc/bin/mrbc  # Should show: ELF 64-bit LSB executable
-   ```
-
-## Test 1: Verify External mrbcfile Skips Host Build
-
-### Test Procedure
-
-1. **Clean build directory (but keep mrbc):**
-   ```bash
-   rm -rf build/host
-   rm -rf build/host-shared
-   rm -rf build/repos
-   ```
-
-2. **Attempt build with skip_host_build config:**
-   ```bash
-   MRUBY_CONFIG=skip_host_build rake all
-   ```
-
-3. **Verify results:**
-   ```bash
-   # Host build directory should NOT exist
-   if [ ! -d build/host ]; then
-     echo "✓ SUCCESS: Host build was skipped"
-   else
-     echo "✗ FAILURE: Host build was created"
-     ls -la build/host/
-   fi
-
-   # mrbc should still work (from external path)
-   if [ -f build/host/mrbc/bin/mrbc ]; then
-     echo "✓ SUCCESS: External mrbc is being used"
-   else
-     echo "✗ FAILURE: External mrbc not found"
-   fi
-   ```
-
-### Expected Results
-
-```
-✓ SUCCESS: Host build was skipped
-✓ SUCCESS: External mrbc is being used
+```bash
+rake clean
+rake all                      # produces build/host/mrbc/bin/mrbc
+mkdir -p /tmp/external_mrbc
+cp build/host/mrbc/bin/mrbc /tmp/external_mrbc/mrbc
+/tmp/external_mrbc/mrbc --version   # sanity check it runs standalone
 ```
 
-**What should happen:**
-- No `build/host/src` directory
-- No `build/host/lib` directory  
-- No `build/host/bin` directory
-- Build completes successfully using the external mrbc
-- Ruby files (.rb) are still compiled to bytecode via the external mrbc
+## Step 2: Remove all trace of a host build
 
-## Test 2: Verify Cross-Compilation with Skipped Host Build
-
-### Test Procedure
-
-1. **Start fresh:**
-   ```bash
-   rake clean
-   rm -rf build/
-   ```
-
-2. **Create initial mrbc:**
-   ```bash
-   rake all
-   # Creates build/host/mrbc/bin/mrbc
-   ```
-
-3. **Remove full host build:**
-   ```bash
-   rm -rf build/host/src build/host/lib build/host/bin build/host/mrblib
-   # Keep only build/host/mrbc
-   ```
-
-4. **Build with cross_skip_host config:**
-   ```bash
-   MRUBY_CONFIG=cross_skip_host rake all
-   ```
-
-5. **Verify:**
-   ```bash
-   # Host source/lib/bin should not be rebuilt
-   if [ ! -d build/host/src ] && [ ! -d build/host/lib ]; then
-     echo "✓ SUCCESS: Host build remains skipped"
-   else
-     echo "✗ FAILURE: Host build was reconstructed"
-   fi
-
-   # Cross-compilation should succeed
-   if [ -d build/cross-32bit/lib ]; then
-     echo "✓ SUCCESS: Cross-build completed"
-     ls -la build/cross-32bit/lib/libmruby.a
-   else
-     echo "✗ FAILURE: Cross-build failed"
-   fi
-   ```
-
-### Expected Results
-
-```
-✓ SUCCESS: Host build remains skipped
-✓ SUCCESS: Cross-build completed
--rw-r--r-- 1 user user 12345678 Nov 27 10:30 build/cross-32bit/lib/libmruby.a
+```bash
+rm -rf build
+ls build   # should fail: No such file or directory
 ```
 
-## Test 3: Code-Level Verification
+## Step 3: Build with skip_host_build, no host build should appear
 
-Verify the mechanism by inspecting code execution:
-
-### Check 1: mrbcfile_external Flag
-
-The external mrbc flag should be set after `conf.mrbcfile = "path"`:
-
-```ruby
-# In lib/mruby/build.rb, line 367-369:
-def mrbcfile=(path)
-  @mrbcfile = path
-  @mrbcfile_external = true  # ← This flag prevents host build
-end
+```bash
+EXTERNAL_MRBC=/tmp/external_mrbc/mrbc \
+  MRUBY_CONFIG=skip_host_build rake all
 ```
 
-### Check 2: create_mrbc_build Condition
+Verify:
 
-Verify that create_mrbc_build is skipped:
+```bash
+ls build/
+# Expect only: skip-host-example/
+# NOT: host/
 
-```ruby
-# In lib/mruby/build.rb, line 152-154:
-if current.libmruby_enabled? && !current.mrbcfile_external?
-  #                               ↑ This is FALSE when external mrbc is set
-  current.create_mrbc_build if current.host? || current.gems["mruby-bin-mrbc"]
-  # ↑ This is NOT called
-end
+[ -d build/host ] && echo "FAIL: build/host exists" || echo "OK: no build/host"
 ```
 
-### Check 3: mrbcfile Resolution
+## Step 4: Verify the resulting binaries actually work
 
-When build needs mrbc:
+```bash
+build/skip-host-example/bin/mruby -e 'puts 1 + 2'
+# => 3
 
-```ruby
-# In lib/mruby/build.rb, line 352-365:
-def mrbcfile
-  return @mrbcfile if @mrbcfile  # ← Returns external mrbc path
-  # ... other fallbacks not reached ...
-end
+echo 'puts "hi"' > /tmp/t.rb
+build/skip-host-example/bin/mrbc -o /tmp/t.mrb /tmp/t.rb
+ls -la /tmp/t.mrb
 ```
 
-## Test 4: Build Directory Structure Comparison
+## Step 5 (optional): Confirm via the build log
 
-### Normal Build (with host)
+```bash
+EXTERNAL_MRBC=/tmp/external_mrbc/mrbc \
+  MRUBY_CONFIG=skip_host_build rake clean all 2>&1 | tee /tmp/build.log
 
-```
-build/
-├── host/
-│   ├── mrbc/
-│   │   └── bin/mrbc              (mrbc compiler)
-│   ├── src/                       (C objects)
-│   ├── lib/
-│   │   └── libmruby.a
-│   ├── bin/
-│   │   ├── mruby
-│   │   └── mirb
-│   └── mrblib/
-├── host-shared/
-│   └── lib/
-│       └── libmruby.so            (if configured)
-└── ...
+grep -c 'build/host' /tmp/build.log   # expect: 0
+grep -A2 'Config Name' /tmp/build.log # expect: only "skip-host-example"
 ```
 
-### Skip Host Build Config
+## Expected Results (all observed when this was last run)
 
 ```
-build/
-├── host/
-│   ├── mrbc/
-│   │   └── bin/mrbc              (external, pre-existing)
-│   ├── src/                       (NOT created)
-│   ├── lib/                       (NOT created)
-│   └── bin/                       (NOT created)
-└── ...
+$ ls build/
+skip-host-example/
+
+$ [ -d build/host ] && echo FAIL || echo "OK: no build/host"
+OK: no build/host
+
+$ build/skip-host-example/bin/mruby -e 'puts 1 + 2'
+3
+
+$ grep -c 'build/host' /tmp/build.log
+0
+
+$ grep -A2 'Config Name' /tmp/build.log
+      Config Name: skip-host-example
+ Output Directory: build/skip-host-example
+         Binaries: mrbc
 ```
 
-**Key Differences:**
-- `build/host/src/` NOT created
-- `build/host/lib/libmruby.a` NOT created
-- `build/host/bin/mruby` NOT created (if not in config)
-- Only `build/host/mrbc/bin/mrbc` remains (external)
+## Negative test: EXTERNAL_MRBC unset fails fast
+
+```bash
+unset EXTERNAL_MRBC
+MRUBY_CONFIG=skip_host_build rake all
+```
+
+Expected: `rake aborted!` with a message telling you to set
+`EXTERNAL_MRBC`, rather than silently falling back to building a host
+target.
+
+## What This Does NOT Test
+
+This does not test using `conf.mrbcfile` on a plain, named-'host'
+`MRuby::Build.new` -- that is a different mechanism (it only skips the
+internal `build/host/mrbc` bootstrap sub-build, not the `host` build
+itself) and does not belong under "skip the host build". See
+`SKIP_HOST_BUILD_ANALYSIS.md` for the distinction and why an earlier
+config in this directory (`skip_host_build.rb`, before it was corrected)
+demonstrated the wrong mechanism.
 
 ## Troubleshooting
 
-### Issue: "external mrbc not found"
+### "set EXTERNAL_MRBC..."
 
-**Cause:** External mrbc path doesn't exist
+`EXTERNAL_MRBC` is unset or points at a missing file. Re-run Step 1.
 
-**Solution:**
-1. Run full build first: `rake clean all`
-2. Verify mrbc exists: `ls build/host/mrbc/bin/mrbc`
-3. Check path in config matches actual location
+### Linker errors about `mrb_hal_io_*`
 
-### Issue: "command not found: mrbc"
+The cross target has no HAL port configured (`conf.ports` unset defaults
+to `[]` for `CrossBuild`). Add `conf.ports :posix` (or whatever port
+matches your actual target) if the gembox includes `mruby-io`.
 
-**Cause:** External mrbc is not executable or wrong architecture
+### "command not found" / mrbc fails at runtime
 
-**Solution:**
-1. Check permissions: `chmod +x /path/to/mrbc`
-2. Verify architecture: `file /path/to/mrbc`
-3. Confirm it matches build system: `uname -m` vs `mrbc` architecture
-
-### Issue: Build fails with "ruby files not compiled"
-
-**Cause:** External mrbc failed to execute
-
-**Solution:**
-1. Test mrbc manually: `/path/to/mrbc --version`
-2. Check if linked libraries exist: `ldd /path/to/mrbc`
-3. Fallback to full build: `rake clean all`
-
-## Performance Metrics
-
-### Build Time Comparison
-
-Expected improvement when skipping host build:
-
-| Operation | Full Build | Skip Host |
-|-----------|-----------|-----------|
-| Clean + rebuild | ~120s | ~30s |
-| Rebuild (no changes) | ~5s | ~2s |
-| Cross-compile only | N/A | ~60s |
-
-**Caveat:** Times vary by system, compiler, and gem count.
-
-## Summary
-
-The skip host build feature works by:
-
-1. Setting `conf.mrbcfile = "/path/to/mrbc"` 
-2. This sets `@mrbcfile_external = true`
-3. Which prevents `create_mrbc_build` from being called
-4. So `build/host/src`, `build/host/lib`, etc. are not created
-5. The specified external mrbc is used for all Ruby compilation
-
-This reduces build time and resource usage when rebuilding or cross-compiling, assuming a compatible mrbc already exists.
+The external mrbc is either not executable (`chmod +x`) or was built for
+a different architecture than the machine currently running `rake`.
+Check with `file /path/to/mrbc` and `uname -m`.

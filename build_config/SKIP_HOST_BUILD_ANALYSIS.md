@@ -1,242 +1,147 @@
-# Skip Host Build Analysis
+# Skipping the 'host' Build: Analysis
 
 ## Overview
 
-This document explains how to use `conf.mrbcfile` to prevent the implicit host build generation in mruby.
+This document explains how (and how not) to avoid building a 'host'
+target in mruby, using `conf.mrbcfile`.
 
-## The Mechanism
+## Two different things named "host build"
 
-### Default Behavior (Host Build Created)
+mruby's build system has two related but distinct concepts, and mixing
+them up produces a config that looks like it skips the host build but
+doesn't:
 
-When you use standard build configuration:
+1. **The 'host' target itself** -- created by calling `MRuby::Build.new`
+   (its default `name` is `'host'`, see `lib/mruby/build.rb`). If your
+   config calls this at all, a full host build (`build/host/src`,
+   `build/host/lib`, `build/host/bin`, ...) is compiled, full stop.
+   `conf.mrbcfile` does **not** prevent this -- you asked for this build
+   to exist by calling `MRuby::Build.new`.
 
-```ruby
-MRuby::Build.new do |conf|
-  conf.toolchain :gcc
-end
-```
+2. **The implicit minimal 'host' bootstrap build that `CrossBuild` adds
+   for you** -- if a config defines only `MRuby::CrossBuild` targets and
+   never calls `MRuby::Build.new`, `CrossBuild#initialize` will add a
+   *minimal* `MRuby::Build.new('host')` on your behalf (mrbc only,
+   `libmruby` disabled), because it needs some mrbc to compile mrblib
+   with. This is the one `conf.mrbcfile` can prevent.
 
-The build system executes the following check in `lib/mruby/build.rb` (lines 152-154):
+## The Mechanism That Actually Skips a 'host' Target
 
-```ruby
-if current.libmruby_enabled? && !current.mrbcfile_external?
-  current.create_mrbc_build if current.host? || current.gems["mruby-bin-mrbc"]
-end
-```
-
-Since `mrbcfile_external?` is `false` (default), `create_mrbc_build` is invoked, which generates:
-- Minimal host build (mrbc compiler)
-- Stored in `build/host/mrbc/bin/mrbc`
-
-### With External mrbcfile (No Host Build)
-
-When you specify an external mrbc:
+`lib/mruby/build.rb`, `CrossBuild#initialize`:
 
 ```ruby
-MRuby::Build.new do |conf|
-  conf.toolchain :gcc
-  conf.mrbcfile = "/path/to/existing/mrbc"  # ← External mrbc specified
-end
-```
-
-The `mrbcfile=` method (lines 367-370 in `lib/mruby/build.rb`):
-
-```ruby
-def mrbcfile=(path)
-  @mrbcfile = path
-  @mrbcfile_external = true  # ← This flag prevents host build
-end
-```
-
-Result:
-- `mrbcfile_external?` returns `true`
-- The condition `!current.mrbcfile_external?` becomes `false`
-- `create_mrbc_build` is **NOT called**
-- **No host build directory is created**
-- The specified external mrbc is used for .rb → bytecode compilation
-
-## Key Code Paths
-
-### 1. External mrbcfile Detection (lib/mruby/build.rb:152-154)
-
-```ruby
-if current.libmruby_enabled? && !current.mrbcfile_external?
-  current.create_mrbc_build if current.host? || current.gems["mruby-bin-mrbc"]
-end
-```
-
-**Condition**: `!current.mrbcfile_external?`
-- When `true` (default): create minimal host build
-- When `false` (external mrbc set): skip host build creation
-
-### 2. mrbcfile Getter (lib/mruby/build.rb:352-365)
-
-When mrbc is needed during build:
-
-```ruby
-def mrbcfile
-  return @mrbcfile if @mrbcfile  # Use pre-set external mrbc
-  
-  if (gem = @gems["mruby-bin-mrbc"])
-    @mrbcfile = exefile("#{gem.build.build_dir}/bin/mrbc")
-  elsif !host? && (host = MRuby.targets["host"])
-    if (gem = host.gems["mruby-bin-mrbc"])
-      @mrbcfile = exefile("#{gem.build.build_dir}/bin/mrbc")
-    elsif host.mrbcfile_external?
-      @mrbcfile = host.mrbcfile
+def initialize(name, build_dir=nil, &block)
+  @test_runner = Command::CrossTestRunner.new(self)
+  super
+  unless mrbcfile_external? || MRuby.targets['host']
+    # add minimal 'host'
+    MRuby::Build.new('host') do |conf|
+      conf.toolchain
+      conf.build_mrbc_exec
+      conf.disable_libmruby
     end
   end
-  @mrbcfile || fail("external mrbc or mruby-bin-mrbc gem required")
 end
 ```
 
-### 3. mrbcfile Setter (lib/mruby/build.rb:367-374)
+`mrbcfile_external?` becomes `true` as soon as `conf.mrbcfile = path` is
+assigned (`lib/mruby/build.rb`, `Build#mrbcfile=`):
 
 ```ruby
 def mrbcfile=(path)
   @mrbcfile = path
-  @mrbcfile_external = true  # Sets the flag
-end
-
-def mrbcfile_external?
-  @mrbcfile_external
+  @mrbcfile_external = true
 end
 ```
 
-## Build Configuration Examples
+So: **set `conf.mrbcfile` on a `CrossBuild`, and never call
+`MRuby::Build.new` anywhere in the same config file** -- then no `host`
+target, minimal or full, is created at all.
 
-### Example 1: Skip Host Build (Requires Pre-built mrbc)
+## What `conf.mrbcfile` Does on a Plain `MRuby::Build.new` (NOT This)
+
+A separate, unrelated mechanism exists inside `Build#initialize`:
 
 ```ruby
-# build_config/skip_host_build.rb
-MRuby::Build.new do |conf|
+if current.libmruby_enabled? && !current.mrbcfile_external?
+  current.create_mrbc_build if current.host? || current.gems["mruby-bin-mrbc"]
+end
+```
+
+`create_mrbc_build` builds a small bootstrap sub-target named
+`"#{@name}/mrbc"` (e.g. `build/host/mrbc`) used to compile mrblib for
+*that same build*. Setting `conf.mrbcfile` on, say, an unnamed
+`MRuby::Build.new` (name `'host'`) skips regenerating that bootstrap
+sub-target and reuses the external mrbc for it -- but the main `host`
+build (`build/host/src`, `lib`, `bin`) still compiles fully, because you
+explicitly asked for a `host` target to exist. **This does not skip the
+host build.** An earlier version of this document, and a
+`build_config/skip_host_build.rb` written this way, made this mistake --
+confirmed by testing: it still produced ~66 MB of `build/host/{src,lib,mrbgems}`
+output even with `conf.mrbcfile` set.
+
+## Verified Working Configuration
+
+```ruby
+# No MRuby::Build.new call anywhere in this file.
+
+external_mrbc = ENV['EXTERNAL_MRBC']
+fail "set EXTERNAL_MRBC" unless external_mrbc && File.exist?(external_mrbc)
+
+MRuby::CrossBuild.new('skip-host-example') do |conf|
   conf.toolchain :gcc
-  
-  # Specify external mrbc (must exist and be host-compatible)
-  conf.mrbcfile = "#{MRUBY_ROOT}/build/host/mrbc/bin/mrbc"
-  
+  conf.mrbcfile = external_mrbc
+  conf.ports :posix   # CrossBuild doesn't auto-detect a HAL port
   conf.gembox 'default'
-  conf.enable_bintest
-  conf.enable_test
 end
 ```
 
-**Usage:**
-```bash
-# First build: Create the mrbc
-rake clean all
+See `build_config/skip_host_build.rb` for the full, runnable version.
 
-# Subsequent builds: Skip host build, use existing mrbc
-MRUBY_CONFIG=skip_host_build rake clean all
+### Test procedure and result
+
+```console
+$ rm -rf build
+$ EXTERNAL_MRBC=/tmp/external_mrbc/mrbc \
+    MRUBY_CONFIG=skip_host_build rake all
+...
+$ ls build/
+skip-host-example/
+$ [ -d build/host ] && echo FAIL || echo "OK: no build/host"
+OK: no build/host
+$ build/skip-host-example/bin/mruby -e 'puts 1+2'
+3
 ```
 
-### Example 2: Cross-Compile with External mrbc
+- `build/host` was never created (0 references to it in the build log).
+- The build summary lists exactly one target: `skip-host-example`.
+- The resulting `mruby` and `mrbc` binaries run correctly.
 
-```ruby
-# build_config/cross_skip_host.rb
-MRuby::Build.new do |conf|
-  conf.toolchain :gcc
-  conf.mrbcfile = "/usr/local/bin/mrbc"  # System mrbc
-end
+## Requirements for the External mrbc
 
-MRuby::CrossBuild.new('arm-linux') do |conf|
-  conf.toolchain :gcc
-  conf.cc.flags << '-march=armv7-a'
-  conf.cc.flags << '--target=arm-linux-gnueabihf'
-  
-  # This build still needs mrbc for Ruby file compilation
-  # It will look for it in: mruby-bin-mrbc gem, or the host build's mrbc
-end
-```
+- Must be a real, executable file.
+- Must run **natively on the machine doing the build** (the build host),
+  not on the cross-compilation target. A binary compiled for ARM will
+  not run to compile mrblib on an x86_64 build machine.
+- Must be compatible with the mruby source/version being built (mrbc's
+  output format and presym layout must match).
+- Should live outside `build/`, since `rake clean` deletes `build/`.
 
-## Requirements and Limitations
+## Requirement Matrix
 
-### What Works (✅)
-
-| Goal | Status |
-|------|--------|
-| Skip `build/host` directory creation | ✅ |
-| Avoid host C compiler invocation | ✅ |
-| Reuse existing host-native mrbc | ✅ |
-| Use cross-compilation without host build | ✅ |
-
-### What Doesn't Work (❌)
-
-| Goal | Status |
-|------|--------|
-| Skip mrbc execution entirely | ❌ |
-| Eliminate all host dependencies | ❌ |
-| Use non-native mrbc | ❌ |
-
-### Critical Requirement
-
-**The specified mrbc must be:**
-1. An actual executable file (not a script or symlink to missing file)
-2. Native to the build system (e.g., x86_64 binary on x86_64 Linux)
-3. Compatible with the mruby version being built
-4. Readable and executable by the build process
-
-## When to Use This Approach
-
-Use `conf.mrbcfile` to skip host build when:
-
-- **Goal**: Reduce build time by avoiding redundant compilations
-- **Context**: Already have a built mrbc available
-- **Constraint**: Host C compiler resources are limited
-- **Requirement**: Don't need fresh host binaries
-
-## When This Won't Work
-
-Don't use this approach when:
-
-- Starting from clean repository (no mrbc available)
-- Need both host and target binaries in single build
-- Building on platform without pre-built mrbc
-- Changing compiler/toolchain (incompatible mrbc)
-
-## Code Flow Diagram
-
-```
-ビルド設定読み込み
-    ↓
-conf.mrbcfile = "/path/to/mrbc" 設定?
-    ├─ Yes → @mrbcfile_external = true
-    │         ↓
-    │   create_mrbc_build() スキップ
-    │   ↓
-    │   build/host ディレクトリは作られない
-    │   外部 mrbc をビルド中に使用
-    │
-    └─ No → @mrbcfile_external = false (デフォルト)
-            ↓
-         create_mrbc_build() 実行
-         ↓
-         build/host/mrbc/bin/mrbc 生成
-```
-
-## Verification Commands
-
-To verify the external mrbc approach works:
-
-```bash
-# 1. Create initial build with host
-rake clean all
-
-# 2. Verify host mrbc exists
-ls -la build/host/mrbc/bin/mrbc
-
-# 3. Remove host build directory (to test truly external mrbc)
-rm -rf build/host
-
-# 4. Build again using skip_host_build config
-MRUBY_CONFIG=skip_host_build rake clean all
-
-# 5. Verify host build was NOT created
-[ ! -d build/host ] && echo "✓ Host build skipped successfully"
-```
+| Goal | `conf.mrbcfile` on `MRuby::Build.new` | `conf.mrbcfile` on `MRuby::CrossBuild` (no `Build.new` in config) |
+|------|:---:|:---:|
+| No `build/host` directory at all | ❌ | ✅ |
+| Avoid host C compiler use in this build | ❌ | ✅ |
+| Reuse an existing host-native mrbc | ✅ (for the bootstrap sub-build only) | ✅ |
+| Skip mrbc execution entirely | ❌ | ❌ |
+| Zero dependency on any host-native executable | ❌ | ❌ (mrbc itself is still one) |
 
 ## Summary
 
-The `conf.mrbcfile = "path"` mechanism leverages the `@mrbcfile_external` flag to prevent implicit host build generation. This is the most efficient and straightforward way to skip the host build when you have an existing, compatible mrbc executable available.
-
-Key insight: The build system checks `!current.mrbcfile_external?` to decide whether to create the minimal mrbc build. By setting an external mrbc path, this flag becomes `true`, and the host build is skipped.
+- To reuse an external mrbc for the bootstrap step *within* a `host`
+  build: set `conf.mrbcfile` on that `MRuby::Build.new`. The host build
+  still fully compiles.
+- To avoid a `host` target existing at all: only define
+  `MRuby::CrossBuild` targets, never call `MRuby::Build.new`, and set
+  `conf.mrbcfile` on the `CrossBuild` to a pre-built, host-native mrbc.

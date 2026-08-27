@@ -149,13 +149,16 @@ module MRuby
       begin
         current.instance_eval(&block)
       ensure
-        # Create minimal mrbc build ONLY if:
-        # 1. libmruby is enabled, AND
-        # 2. No external mrbc was specified (mrbcfile_external? == false)
+        # For the build named 'host' (or any build carrying mruby-bin-mrbc),
+        # bootstrap a minimal "<name>/mrbc" sub-build (e.g. build/host/mrbc)
+        # used to compile mrblib -- unless an external mrbc was already
+        # supplied via conf.mrbcfile=, in which case that bootstrap step is
+        # skipped and the external mrbc is reused instead.
         #
-        # This allows skipping host build by setting:
-        #   conf.mrbcfile = "/path/to/existing/mrbc"
-        # which sets @mrbcfile_external = true, preventing create_mrbc_build()
+        # Note: this only ever affects a build literally named 'host'; it
+        # does not build or skip a 'host' *target*. To avoid a 'host' target
+        # altogether, see CrossBuild#initialize below, which is what skips
+        # the implicit `MRuby::Build.new('host')` for cross builds.
         if current.libmruby_enabled? && !current.mrbcfile_external?
           current.create_mrbc_build if current.host? || current.gems["mruby-bin-mrbc"]
         end
@@ -371,21 +374,31 @@ EOS
       @mrbcfile || fail("external mrbc or mruby-bin-mrbc gem in current('#{@name}') or 'host' build is required")
     end
 
-    # Set an external mrbc path (not built as part of this build).
-    # When set, prevents implicit host build generation by marking
-    # mrbcfile as external. This is useful for cross-compilation or
-    # skipping redundant host compilation.
+    # Set an external, pre-built, host-native mrbc executable (not built as
+    # part of this build) instead of compiling one.
     #
-    # Example:
-    #   conf.mrbcfile = "/path/to/host/mrbc/bin/mrbc"
-    #   # → Skips MRuby::Build.new('host') creation
+    # Effect depends on what `self` is:
+    # - On a CrossBuild: prevents CrossBuild#initialize from adding the
+    #   implicit minimal `MRuby::Build.new('host')` it would otherwise add
+    #   to get a bootstrap mrbc. This is the way to avoid a 'host' target
+    #   entirely -- only call this on a CrossBuild, and never also call
+    #   MRuby::Build.new anywhere in the same config file.
+    # - On a plain Build (e.g. the default, unnamed one -- name 'host'):
+    #   only skips that build's own internal mrbc bootstrap sub-build
+    #   (build/<name>/mrbc); the build itself is still fully compiled.
+    #
+    # Example (skip the 'host' target entirely):
+    #   MRuby::CrossBuild.new('my-target') do |conf|
+    #     conf.mrbcfile = "/path/to/prebuilt/mrbc"  # must run on this machine
+    #   end
+    #   # no MRuby::Build.new call anywhere else in the config
     def mrbcfile=(path)
       @mrbcfile = path
       @mrbcfile_external = true
-end
+    end
 
-    # Returns true if mrbc was set via mrbcfile=(path).
-    # When true, prevents implicit host build generation.
+    # Returns true if mrbc was set via mrbcfile=(path). See mrbcfile= above
+    # for what this does and does not skip.
     def mrbcfile_external?
       @mrbcfile_external
     end
