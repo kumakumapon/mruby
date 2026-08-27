@@ -149,6 +149,13 @@ module MRuby
       begin
         current.instance_eval(&block)
       ensure
+        # Create minimal mrbc build ONLY if:
+        # 1. libmruby is enabled, AND
+        # 2. No external mrbc was specified (mrbcfile_external? == false)
+        #
+        # This allows skipping host build by setting:
+        #   conf.mrbcfile = "/path/to/existing/mrbc"
+        # which sets @mrbcfile_external = true, preventing create_mrbc_build()
         if current.libmruby_enabled? && !current.mrbcfile_external?
           current.create_mrbc_build if current.host? || current.gems["mruby-bin-mrbc"]
         end
@@ -364,11 +371,21 @@ EOS
       @mrbcfile || fail("external mrbc or mruby-bin-mrbc gem in current('#{@name}') or 'host' build is required")
     end
 
+    # Set an external mrbc path (not built as part of this build).
+    # When set, prevents implicit host build generation by marking
+    # mrbcfile as external. This is useful for cross-compilation or
+    # skipping redundant host compilation.
+    #
+    # Example:
+    #   conf.mrbcfile = "/path/to/host/mrbc/bin/mrbc"
+    #   # → Skips MRuby::Build.new('host') creation
     def mrbcfile=(path)
       @mrbcfile = path
       @mrbcfile_external = true
-    end
+end
 
+    # Returns true if mrbc was set via mrbcfile=(path).
+    # When true, prevents implicit host build generation.
     def mrbcfile_external?
       @mrbcfile_external
     end
