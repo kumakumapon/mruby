@@ -934,6 +934,144 @@ assert('String#length(UTF-8)', '15.2.10.5.26') do
   assert_equal 2, "\xe3\x81".length
 end if UTF8STRING
 
+assert('String#length over every lead byte') do
+  # Every lead byte followed by up to five continuation bytes, once with the
+  # lowest continuation byte and once with the highest, so that every boundary
+  # RFC 3629 draws has a sequence on each side of it: a shorter spelling (C0,
+  # C1, E0 80, F0 80), a surrogate (ED A0 and above), U+10FFFF (F4 90 and
+  # above, F5 to F7), and the five and six byte lengths (F8 to FD). The count
+  # a character-indexed build owes is what the reading of RFC 3629 below
+  # answers; over these 3072 strings its answers are CRuby's. A byte-indexed
+  # build owes one per byte. The next test holds the sequences right on
+  # either side of each bound on the second byte.
+  min = [0, 128, 2048, 65536, 2097152, 67108864]
+  claim = ->(c) {
+    if c < 0x80 then 1 elsif c < 0xC0 then 0 elsif c < 0xE0 then 2
+    elsif c < 0xF0 then 3 elsif c < 0xF8 then 4 elsif c < 0xFC then 5
+    elsif c < 0xFE then 6 else 0 end
+  }
+  # the byte length of the character at bytes[i], or 1 where the bytes there
+  # spell none; the fillers are continuation bytes, so only the count and the
+  # value can fall short
+  charlen = ->(bytes, i) {
+    c = bytes[i]
+    n = claim.call(c)
+    next 1 if n < 2 || n > 4 || bytes.size - i < n
+    v = c & (0x7F >> n)
+    (1...n).each {|k| v = (v << 6) | (bytes[i + k] & 0x3F) }
+    next 1 if v < min[n - 1] || v > 0x10FFFF || (0xD800 <= v && v <= 0xDFFF)
+    n
+  }
+  0.upto(255) do |c|
+    [0x80, 0xBF].each do |f|
+      0.upto(5) do |k|
+        bytes = [c] + [f] * k
+        s = "\0" * bytes.size
+        bytes.each_with_index {|b, i| s.setbyte(i, b) }
+        expected = 0
+        i = 0
+        while i < bytes.size
+          i += UTF8STRING ? charlen.call(bytes, i) : 1
+          expected += 1
+        end
+        assert_equal expected, s.length, bytes.inspect
+      end
+    end
+  end
+end
+
+assert('String#length on either side of each bound on the second byte') do
+  # Each pair differs in the byte after the lead alone, one step across the
+  # floor of three and four bytes, the surrogates and U+10FFFF.
+  [
+    ["\xE0\x9F\xBF", 3],     ["\xE0\xA0\x80", 1],
+    ["\xED\x9F\xBF", 1],     ["\xED\xA0\x80", 3],
+    ["\xF0\x8F\xBF\xBF", 4], ["\xF0\x90\x80\x80", 1],
+    ["\xF4\x8F\xBF\xBF", 1], ["\xF4\x90\x80\x80", 4],
+  ].each do |s, n|
+    assert_equal (UTF8STRING ? n : s.bytesize), s.length, s.inspect
+  end
+end
+
+assert('String#length leaves what its walk read on the string') do
+  # Counting decodes every sequence, which is the whole of what asking whether
+  # the string reads as UTF-8 does, and the readers that follow are owed the
+  # same answers a string counted first used to give.
+  s = 'あいう'
+  assert_equal 3, s.length
+  assert_equal 'い', s[1]
+
+  # A count is not a reading: bytes that spell no character count one each,
+  # which is the length these have always had, wherever the break sits.
+  [["あ\xffい", 3], ["あ\xe3\x81", 3], ["\x82あ", 2]].each do |str, n|
+    assert_equal n, str.length, str.inspect
+  end
+  b = "あ\xffい"
+  assert_equal 3, b.length
+  assert_equal "\xff", b[1]
+  assert_equal 2, b.index('い')
+
+  # A write through the buffer takes the reading back.
+  m = 'あい'
+  m.length
+  m[1] = "\xff"
+  assert_equal 2, m.length
+  assert_equal "\xff", m[1]
+end if UTF8STRING
+
+assert('String#length of a string already read as UTF-8') do
+  # A string that has been read carries what its bytes spell, and a string that
+  # spells characters holds one per byte that no character continues, which is
+  # counted a word at a time rather than a character at a time. The two counts
+  # are of the same characters, so they answer the same over strings of every
+  # length up to a few words, holding characters of one to four bytes in every
+  # order: a character crosses a word boundary at each offset, and the bytes
+  # left over past the last whole word run from none to one short of a word.
+  pool = ['a', "é", 'あ', "\u{1F600}"]
+  0.upto(3) do |w|
+    0.upto(24) do |k|
+      s = ''
+      k.times {|i| s += pool[(i + w) % 4] }
+      cold = ('' + s).length      # counted with nothing read of it
+      s[0]                        # read, which leaves what it reads recorded
+      assert_equal k, cold, [w, k].inspect
+      assert_equal k, s.length, [w, k].inspect
+    end
+  end
+end if UTF8STRING
+
+assert('character indexing of a string already read as UTF-8') do
+  # Both directions of the mapping between a character index and a byte offset
+  # read words of a string whose bytes are known to spell characters, and both
+  # owe what stepping a character at a time answers: the same strings as the
+  # count above, asked for every position in them.
+  pool = ['a', "é", 'あ', "\u{1F600}"]
+  0.upto(3) do |w|
+    0.upto(20) do |k|
+      chars = (0...k).map {|i| pool[(i + w) % 4] }
+      s = chars.join
+      s[0]                        # read, which leaves what it reads recorded
+      k.times do |j|
+        where = [w, k, j].inspect
+        assert_equal chars[j], s[j], where
+        assert_equal chars[j] + (chars[j + 1] || ''), s[j, 2], where
+        assert_equal chars[j], s[j - k], where
+        # the pool repeats every four characters, so the one at `j` is the
+        # first of its own from there
+        assert_equal j, s.index(chars[j], j), where
+      end
+      assert_nil s[k]
+    end
+  end
+
+  # A needle lands where a character does or it is not found: these bytes are
+  # the tail of a character rather than one of their own.
+  a = 'あい'
+  a[0]
+  assert_nil a.index("\x81")
+  assert_equal 1, a.index('い')
+end if UTF8STRING
+
 # 'String#match', '15.2.10.5.27' will be tested in mrbgems.
 
 assert('String#replace', '15.2.10.5.28') do

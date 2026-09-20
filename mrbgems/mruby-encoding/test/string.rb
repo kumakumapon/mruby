@@ -45,6 +45,37 @@ assert('String#valid_encoding? survives what the string goes through') do
   end
 end
 
+assert('String#length answers for the bytes it walked') do
+  # Counting decodes every sequence of the string, which is the whole of what
+  # `valid_encoding?` does, so a string counted first is one that has been read
+  # and answers without being read again. What it answers has to be what the
+  # same bytes answer when nothing counted them: broken in the middle, cut
+  # short at the end, and beginning where a character cannot.
+  if UTF8STRING
+    ["あいう", "aあ", "あ" * 40, "abc",
+     "あ\xFFい", "あ\xE3\x81", "\x82あ", "\xED\xA0\x80", "a\x80b"].each do |base|
+      counted = base.dup
+      counted.length
+      assert_equal base.dup.valid_encoding?, counted.valid_encoding?, base.inspect
+      assert_equal base.dup.length, counted.length, base.inspect
+    end
+
+    # A write through the buffer takes the reading back, and one that cannot
+    # change what the bytes read as leaves it standing.
+    m = 'あい'
+    m.length
+    m << "\xFF"
+    assert_false m.valid_encoding?
+    assert_equal 3, m.length
+
+    k = 'Aあ'
+    k.length
+    k.downcase!
+    assert_true k.valid_encoding?
+    assert_equal 'aあ', k
+  end
+end
+
 assert('every mutating method leaves an answer the string can stand behind') do
   # The one rule underneath all of this: after a write, what the string says
   # about its own bytes is either true of them or UNKNOWN. A write that keeps a
@@ -109,8 +140,9 @@ assert('every mutating method leaves an answer the string can stand behind') do
     bases = ["あ", "あa", "aあ", "  あ  ", "\tあ\n", "\0あ\0", "あ" * 40,
              "abc", "a" * 40, "  abc  ", "",
              "\x80", "a\x80b", "\xE3\x81", "\xED\xA0\x80"]
-    # Two readings, because they leave different answers behind: the walk
-    # settles on VALID or BROKEN, while counting marks only 7BIT.
+    # Two readings, because they reach the string by different routes: the walk
+    # of `valid_encoding?` starts at the head, and counting starts at the first
+    # byte that is not ASCII.
     reads = [->(s) { s.valid_encoding? }, ->(s) { s.length }]
 
     # The list above is only a checklist while something keeps it honest. A
@@ -227,6 +259,58 @@ assert('String#valid_encoding?') do
     assert_true "\xfe".valid_encoding?
   end
 end
+
+assert('String#valid_encoding? over every lead byte') do
+  # Every lead byte followed by up to five continuation bytes, once with the
+  # lowest continuation byte and once with the highest, so that every boundary
+  # RFC 3629 draws has a sequence on each side of it: a shorter spelling (C0,
+  # C1, E0 80, F0 80), a surrogate (ED A0 and above), U+10FFFF (F4 90 and
+  # above, F5 to F7), and the five and six byte lengths (F8 to FD). The string
+  # is valid when one sequence RFC 3629 admits covers it exactly, which the
+  # reading of the RFC below decides; over these 3072 strings its answers are
+  # CRuby's. The next test holds the sequences right on either side of each
+  # bound on the second byte.
+  min = [0, 128, 2048, 65536, 2097152, 67108864]
+  claim = ->(c) {
+    if c < 0x80 then 1 elsif c < 0xC0 then 0 elsif c < 0xE0 then 2
+    elsif c < 0xF0 then 3 elsif c < 0xF8 then 4 elsif c < 0xFC then 5
+    elsif c < 0xFE then 6 else 0 end
+  }
+  # whether bytes[i..] is one sequence RFC 3629 admits; the fillers are
+  # continuation bytes, so only the count and the value can fall short
+  admits = ->(bytes) {
+    c = bytes[0]
+    n = claim.call(c)
+    next true if n == 1 && bytes.size == 1
+    next false if n < 2 || n > 4 || bytes.size != n
+    v = c & (0x7F >> n)
+    (1...n).each {|k| v = (v << 6) | (bytes[k] & 0x3F) }
+    v >= min[n - 1] && v <= 0x10FFFF && !(0xD800 <= v && v <= 0xDFFF)
+  }
+  0.upto(255) do |c|
+    [0x80, 0xBF].each do |f|
+      0.upto(5) do |k|
+        bytes = [c] + [f] * k
+        s = "\0" * bytes.size
+        bytes.each_with_index {|b, i| s.setbyte(i, b) }
+        assert_equal admits.call(bytes), s.valid_encoding?, bytes.inspect
+      end
+    end
+  end
+end if UTF8STRING
+
+assert('String#valid_encoding? on either side of each bound on the second byte') do
+  # Each pair differs in the byte after the lead alone, one step across the
+  # floor of three and four bytes, the surrogates and U+10FFFF.
+  [
+    ["\xE0\x9F\xBF", false],     ["\xE0\xA0\x80", true],
+    ["\xED\x9F\xBF", true],      ["\xED\xA0\x80", false],
+    ["\xF0\x8F\xBF\xBF", false], ["\xF0\x90\x80\x80", true],
+    ["\xF4\x8F\xBF\xBF", true],  ["\xF4\x90\x80\x80", false],
+  ].each do |s, valid|
+    assert_equal valid, s.valid_encoding?, s.inspect
+  end
+end if UTF8STRING
 
 assert('String#valid_encoding? answers the same however the string was read first') do
   # A string read once is marked as holding one character per byte where every

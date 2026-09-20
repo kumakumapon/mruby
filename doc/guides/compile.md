@@ -395,7 +395,10 @@ configured to use C++ exception.
 There are two levels of C++ exception handling. The one is
 `enable_cxx_exception` that enables C++ exception, but
 uses C ABI. The other is `enable_cxx_abi` where all
-files are compiled by C++ compiler.
+files are compiled by C++ compiler, except the Prism parser under
+`mruby-compiler`, which is a C library and stays on the C compiler. A C++
+standard added to `conf.cc.flags` (`-std=c++23`) reaches every C++ file and
+is dropped for those C files.
 
 When you mix C++ code, C++ exception would be enabled automatically.
 If you need to enable C++ exception explicitly add the following:
@@ -720,6 +723,13 @@ of mruby, a native binary called `mrbtest` will be generated and executed.
 This binary contains all test cases which are defined under `test/t`. In case
 of a cross-compilation an additional cross-compiled `mrbtest` binary is
 generated. You can copy this binary and run on your target system.
+
+`mrbtest -v` names each test as it runs. A test that has to loop, recurse or
+allocate far past what the behaviour it checks needs, to reach a limit such as
+a symbol GC sweep or a C stack overflow, is marked with `stress` at the top of
+its block and is held back by default; the summary counts them on a `Stress:`
+line. Run them with `mrbtest -s`, or with `MRBTEST_STRESS=1` in the
+environment, which also reaches `rake test`.
 
 ## Embedding `mruby` in Your Application
 

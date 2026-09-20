@@ -379,10 +379,12 @@ mrb_vm_ci_env_clear(mrb_state *mrb, mrb_callinfo *ci)
 {
   struct REnv *e = ci->u.env;
   if (e && e->tt == MRB_TT_ENV) {
-    ci->u.target_class = e->c;
     /* The escaping env carries the container, so a proc from the earlier
-       top-level chunk keeps reading the scope it was written in. */
+       top-level chunk keeps reading the scope it was written in. The frame
+       keeps the env through the detach, as cipop() does, so the closing
+       allocation's collection finds it rooted. */
     mrb_env_detach(mrb, e, mrb_ci_svar(mrb->c, ci), FALSE);
+    ci->u.target_class = e->c;
   }
   /* The frame itself starts the next chunk in a fresh scope, the way each
      file `ruby -r` loads gets one of its own; a caller that wants a single
@@ -438,7 +440,7 @@ svar_scope_env(const struct RProc *p)
  * slot, a scopeless frame is as transparent to the special variables as
  * the C function that pushed it, the way CRuby's `rb_eval_string()` shares
  * the scope below; when its env escapes, the transparency outlives the
- * frame by adoption (svar_env_adopt_owner()). Blocks and lambdas always
+ * frame by adoption (svar_owner_adopt()). Blocks and lambdas always
  * capture, so they never answer TRUE. */
 static mrb_bool
 svar_scopeless_frame_p(const mrb_callinfo *ci)
@@ -468,8 +470,9 @@ svar_scopeless_frame_p(const mrb_callinfo *ci)
  * VM's own stack. That test comes first because it is also what a swept
  * env looks like: mrb_env_unshare() answers TRUE without touching an env
  * the collection inside its allocation freed, and a freed cell's flags say
- * nothing, so the callers that close an env and then read its slot,
- * cipop() and mrb_env_detach(), still find such an env on the stack. */
+ * nothing. The callers that close an env keep it rooted through that
+ * allocation (cipop(), mrb_vm_ci_env_clear()), so none of them reads a
+ * slot off a swept env; the test stands for an env closed elsewhere. */
 static mrb_value*
 env_svar_slot(struct REnv *e)
 {
@@ -671,7 +674,7 @@ svar_owner_container(const struct mrb_context *c, mrb_callinfo *ci, struct REnv 
 /* Resolves the current owner and answers its container, making one on the
  * spot when the scope holds none yet: the first non-nil write does this
  * (mrb_vm_svar_set()), and so does a scopeless frame whose env escapes
- * (svar_env_adopt_owner()), so the adopted slot and the scope share one
+ * (svar_owner_adopt()), so the adopted slot and the scope share one
  * object before either side has written. NULL when resolution found no
  * scope that could hold one.
  * Installing a fresh container into a frame needs no barrier of its own
@@ -733,7 +736,7 @@ svar_owner_force(mrb_state *mrb)
  * representation an escaped scopeless env uses: neither caller may make a
  * container here, gc_mark_children() (gc.c) running mid-collection and
  * mrb_env_detach_all() mid-teardown, where cipop() materializes one
- * instead (svar_env_adopt_owner()). NULL where there is nothing to carry,
+ * instead (svar_owner_adopt()). NULL where there is nothing to carry,
  * and for an owner that is the context's own root frame, whose container
  * dies with the context the way the root frame's own does. */
 struct RBasic*
@@ -1052,7 +1055,7 @@ env_unshare_with_svar(mrb_state *mrb, struct REnv *e, struct RBasic *sv, mrb_boo
  * context down, and mrb_vm_ci_env_clear() below. Callers on a frame whose
  * container must die with its context, a fiber or task root, pass sv as
  * NULL; a scopeless frame owns none to pass, and its callers hand the
- * slot what the scope below has instead (svar_env_adopt_owner() on a
+ * slot what the scope below has instead (svar_owner_adopt() on a
  * return, mrb_svar_frame_container() on a teardown), which is that
  * scope's container or, where it holds none, its env as a forward.
  * The two arms close the env in exactly one allocation either way (see
@@ -1069,40 +1072,46 @@ mrb_env_detach(mrb_state *mrb, struct REnv *e, struct RBasic *sv, mrb_bool norai
 /* A scopeless frame is transparent while it runs: svar_owner() walks past
  * it to the scope below. When its env escapes, that relation would die
  * with the frame, the frame's own container being the NULL it never
- * needed, so the freshly closed env adopts the owner's container instead,
- * made on the spot when the owner holds none yet: a proc the load left
- * behind keeps reading and writing the scope below, and a match made on
- * either side after the return is seen on the other, the way CRuby's ep
- * chain crosses an eval frame after its escape. Runs after cipop()
- * decrements: resolution then starts at the scope below, and an
- * allocation failure raises out of a consistent stack, leaving the slot
- * empty. The env may already be garbage, nothing but an unreachable proc
- * holding it, and the allocation the owner may need can collect it, so
- * liveness is re-checked before the write. */
-static void
-svar_env_adopt_owner(mrb_state *mrb, struct REnv *e)
+ * needed, so the closing env adopts the owner's container instead, made
+ * on the spot when the owner holds none yet: a proc the load left behind
+ * keeps reading and writing the scope below, and a match made on either
+ * side after the return is seen on the other, the way CRuby's ep chain
+ * crosses an eval frame after its escape. Resolution walks past the
+ * scopeless frame whether or not it still stands, so this runs before
+ * cipop() touches the frame at all: the env is still the frame's, and
+ * the frame's registers, the return value among them, are still the
+ * stack's, so the collection the container allocation may run cannot
+ * sweep either from under it. The container then rides into the closing
+ * env inside mrb_env_detach()'s own allocation, the way a frame's own
+ * does, and no allocation touches a popped frame's env, which nothing
+ * but an escaped proc may keep alive by then.
+ * An allocation failure inside is caught rather than raised here: the
+ * frame is untouched at that point, so the raise would be handled inside
+ * the frame being returned from and its unwinding would come back to this
+ * cipop() to fail the same way (#3087), while a raise out of a consistent
+ * stack after the pop unwinds one frame per attempt. The exception comes
+ * back in *exc for the caller to raise once the frame is gone, and the
+ * slot stays empty, as it does for a load that never wrote one. */
+static struct RSvar*
+svar_owner_adopt(mrb_state *mrb, mrb_value *exc)
 {
-  /* MRB_ENV_ONSTACK_P(e) here is the same collected-out-from-under-unshare
-     case mrb_env_detach() skips: no closed env, nothing to grow. */
-  if (MRB_ENV_ONSTACK_P(e)) return;
-  struct RSvar *sv = svar_owner_force(mrb);
-  if (!sv) return;
-  /* Whether the container allocation ran a collection cannot be read off
-     mrb->gc.live (see svar_owner_force()), so re-check either way. The
-     collection may even have recycled the garbage env's own slot as the
-     new container: mrb_object_dead_p() would then inspect the live RSvar
-     and answer alive, so test the type tag first. Nothing else is
-     allocated in the window, so a reused slot can hold nothing but it. */
-  struct RBasic *b = (struct RBasic*)e;
-  if (b->tt != MRB_TT_ENV || mrb_object_dead_p(mrb, b)) return;
-  /* Grows a closed env sized without the slot into one (see internal.h).
-     No allocation has run since the dead-check just above passed, so the
-     resize's own allocation still finds the object that check vouched
-     for, the same one-allocation tolerance svar_owner_force()'s own
-     grow relies on, immediately after its own fresh resolution. */
-  mrb_value *slot = svar_slot_ensure(mrb, e);
-  *slot = mrb_obj_value(sv);
-  mrb_write_barrier(mrb, (struct RBasic*)e);
+  struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+  struct mrb_jmpbuf c_jmp;
+  struct RSvar *sv = NULL;
+
+  MRB_TRY(&c_jmp) {
+    mrb->jmp = &c_jmp;
+    sv = svar_owner_force(mrb);
+    mrb->jmp = prev_jmp;
+  }
+  MRB_CATCH(&c_jmp) {
+    mrb->jmp = prev_jmp;
+    *exc = mrb_obj_value(mrb->exc);
+    mrb->exc = NULL;
+    sv = NULL;
+  }
+  MRB_END_EXC(&c_jmp);
+  return sv;
 }
 
 /* Detaches every live on-stack env of a context being torn down around it:
@@ -1179,25 +1188,35 @@ cipop(mrb_state *mrb)
   }
 
   struct REnv *env = CI_ENV(ci);
-  ci_env_set(ci, NULL); // make possible to free env by GC if not needed
   struct RProc *b = ci->blk;
   if (b && !MRB_PROC_STRICT_P(b) && MRB_PROC_ENV(b) == CI_ENV(&ci[-1])) {
     b->flags |= MRB_PROC_ORPHAN;
   }
   if (env) {
     /* The container escapes with the locals (see mrb_env_detach()); a
-       frame without an env leaves no proc behind that could look. */
+       frame without an env leaves no proc behind that could look. A
+       scopeless frame has none of its own and hands on its owner's
+       (svar_owner_adopt()), which is the one allocation here that runs
+       before the frame lets go of the env: the env stays the frame's
+       through the detach as well, so the collection that either
+       allocation may run finds it rooted, and the closed env is freed
+       later, by the collection after the last proc holding it goes, the
+       same as one nothing captured. */
     struct RBasic *sv = mrb_ci_svar(c, ci);
-    mrb_bool transparent = (sv == NULL && svar_scopeless_frame_p(ci));
-    if (!mrb_env_detach(mrb, env, sv, TRUE)) {
-      c->ci--; // exceptions are handled at the method caller; see #3087
+    mrb_value exc = mrb_nil_value();
+    if (sv == NULL && svar_scopeless_frame_p(ci)) {
+      sv = (struct RBasic*)svar_owner_adopt(mrb, &exc);
+    }
+    mrb_bool detached = mrb_env_detach(mrb, env, sv, TRUE);
+    ci_env_set(ci, NULL);
+    c->ci--; // exceptions are handled at the method caller; see #3087
+    if (!detached) {
       mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
     }
-    if (transparent) {
-      c->ci--;
-      svar_env_adopt_owner(mrb, env);
-      return c->ci;
+    if (!mrb_nil_p(exc)) {
+      mrb_exc_raise(mrb, exc);
     }
+    return c->ci;
   }
   c->ci--;
   return c->ci;
@@ -1695,6 +1714,19 @@ mrb_exec_irep(mrb_state *mrb, mrb_value self, const struct RProc *p)
   }
 }
 
+#ifdef MRB_USE_REFINEMENTS
+/* The refinements active for the Ruby code that called the running C
+   function, or NULL when it was called from C. */
+struct RArray*
+mrb_vm_caller_refinements(mrb_state *mrb)
+{
+  mrb_callinfo *ci = mrb->c->ci;
+
+  if (mrb->refscopes_len == 0 || ci->cci != CINFO_NONE || ci == mrb->c->cibase) return NULL;
+  return mrb_vm_refinements(mrb, ci - 1);
+}
+#endif
+
 mrb_value
 mrb_object_exec(mrb_state *mrb, mrb_value self, struct RClass *target_class)
 {
@@ -1732,7 +1764,9 @@ send_method(mrb_state *mrb, mrb_value self, mrb_bool pub)
   mrb_sym name;
 
   if (ci->cci > CINFO_NONE) {
+#ifndef MRB_USE_REFINEMENTS
   funcall:;
+#endif
     const mrb_value *argv;
     mrb_int argc;
     mrb_value block;
@@ -1756,10 +1790,25 @@ send_method(mrb_state *mrb, mrb_value self, mrb_bool pub)
   }
 
   struct RClass *c = mrb_class(mrb, self);
+#ifdef MRB_USE_REFINEMENTS
+  m = mrb_vm_find_method_in_scope(mrb, mrb_vm_caller_refinements(mrb), c, &c, name);
+  if (MRB_METHOD_UNDEF_P(m)) {
+    /* `method_missing` is sent by name: a funcall of the name itself would
+       look it up with no scope and reach a method the scope undefines */
+    const mrb_value *argv;
+    mrb_int argc;
+    mrb_value block;
+    mrb_get_args(mrb, "n*&", &name, &argv, &argc, &block);
+    mrb_value args = mrb_ary_new_from_values(mrb, argc, argv);
+    mrb_ary_unshift(mrb, args, mrb_symbol_value(name));
+    return mrb_funcall_with_block(mrb, self, MRB_SYM(method_missing), RARRAY_LEN(args), RARRAY_PTR(args), block);
+  }
+#else
   m = mrb_vm_find_method(mrb, c, &c, name);
   if (MRB_METHOD_UNDEF_P(m)) {            /* call method_missing */
     goto funcall;
   }
+#endif
 
   if (pub) {
     mrb_bool priv = TRUE;
@@ -3755,6 +3804,25 @@ RETRY_TRY_BLOCK:
       ci = cipush(mrb, a, CINFO_DIRECT, NULL, NULL, BLK_PTR(blk), 0, c);
       recv = regs[0];
       ci->u.target_class = (insn == OP_SUPER) ? CI_TARGET_CLASS(ci - 1)->super : mrb_class(mrb, recv);
+#ifdef MRB_USE_REFINEMENTS
+      /* A refined name is looked up as the calling frame's scope sees it.
+         `super` in a refined method passes over the refinement it is in. */
+      if (mrb->refscopes_len && mrb_refined_mid_p(mrb, mid)) {
+        struct RArray *scope = mrb_vm_refinements(mrb, ci - 1);
+        if (scope) {
+          struct RClass *exclude = NULL;
+          if (insn == OP_SUPER) {
+            struct RClass *cur = CI_TARGET_CLASS(ci - 1);
+            if (MRB_CLASS_REFINEMENT_P(cur)) exclude = cur;
+          }
+          m = mrb_vm_find_refined_method(mrb, scope, ci->u.target_class, &ci->u.target_class, mid, exclude);
+        }
+        else {
+          m = mrb_vm_find_method(mrb, ci->u.target_class, &ci->u.target_class, mid);
+        }
+      }
+      else
+#endif
       m = mrb_vm_find_method(mrb, ci->u.target_class, &ci->u.target_class, mid);
       if (mrb_unlikely(MRB_METHOD_UNDEF_P(m))) {
         m = prepare_missing(mrb, ci, recv, mid, (insn == OP_SUPER));
@@ -3788,10 +3856,17 @@ RETRY_TRY_BLOCK:
               vis_error(mrb, mid, args, recv, priv);
             }
             /* protected methods are callable when the caller's `self` belongs
-               to the class (or module) where the method is defined */
-            else if (!mrb_obj_is_kind_of(mrb, ci[-1].stack[0], ci->u.target_class)) {
-              priv = FALSE;
-              goto vis_err;
+               to the class (or module) where the method is defined; one a
+               refinement holds belongs to the refined class */
+            else {
+              struct RClass *owner = ci->u.target_class;
+#ifdef MRB_USE_REFINEMENTS
+              if (MRB_CLASS_REFINEMENT_P(owner)) owner = owner->super;
+#endif
+              if (!mrb_obj_is_kind_of(mrb, ci[-1].stack[0], owner)) {
+                priv = FALSE;
+                goto vis_err;
+              }
             }
           }
         }
@@ -3915,10 +3990,28 @@ RETRY_TRY_BLOCK:
       if (mid == 0 || !target_class) {
         RAISE_LIT(mrb, E_NOMETHOD_ERROR, "super called outside of method");
       }
-      if ((target_class->flags & MRB_FL_CLASS_IS_PREPENDED) || target_class->tt == MRB_TT_MODULE) {
+      if (target_class->flags & MRB_FL_CLASS_IS_PREPENDED) {
         goto super_typeerror;
       }
       recv = regs[0];
+      if (target_class->tt == MRB_TT_MODULE) {
+#ifdef MRB_USE_REFINEMENTS
+        /* a refined method runs under its refinement, whose `super` is the
+           class it refines; `self` is checked against that class */
+        if (MRB_CLASS_REFINEMENT_P(target_class) && target_class->super) {
+          target_class = target_class->super;
+        }
+        /* The method of a refined module, reached by a `super` from the
+           refinement: it runs under the module itself and not under the
+           ICLASS its includer holds, so there is no chain to go on up.
+           CRuby refuses the same way (Bug #22071). */
+        else if (mrb_obj_is_kind_of(mrb, recv, target_class)) {
+          RAISE_LIT(mrb, E_NOMETHOD_ERROR, "super in a method in a module that has been refined and that is called via super from a refinement method is not supported.");
+        }
+        else
+#endif
+        goto super_typeerror;
+      }
       if (!mrb_obj_is_kind_of(mrb, recv, target_class)) {
       super_typeerror:
         RAISE_LIT(mrb, E_TYPE_ERROR, "self has wrong type to call super in this context");
@@ -4748,7 +4841,11 @@ RETRY_TRY_BLOCK:
       const mrb_irep *nirep = irep->reps[b];
 
       /* prepare closure */
+#ifdef MRB_USE_REFINEMENTS
+      struct RProc *p = mrb_scope_proc_new(mrb, nirep);
+#else
       struct RProc *p = mrb_proc_new(mrb, nirep);
+#endif
       p->c = NULL;
       mrb_field_write_barrier(mrb, (struct RBasic*)p, (struct RBasic*)ci->proc);
       MRB_PROC_SET_TARGET_CLASS(p, c);
