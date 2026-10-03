@@ -2151,6 +2151,94 @@ mrb_yield_cont(mrb_state *mrb, mrb_value b, mrb_value self, mrb_int argc, const 
   return exec_irep(mrb, self, p);
 }
 
+static mrb_value
+prepare_exec_strcat_post_func(mrb_state *mrb, mrb_value self)
+{
+  if (mrb_get_argc(mrb) != 3) mrb_argnum_error(mrb, mrb_get_argc(mrb), 3, 3);
+
+  const mrb_value *args = mrb_get_argv(mrb);
+  mrb_value str = args[2];
+  mrb_check_type(mrb, args[0], MRB_TT_STRING);
+  /* A to_s that answers something other than a String is not taken at its
+     word: the object gets the default representation instead, the way
+     mrb_type_convert() answers a conversion to String and CRuby's
+     rb_obj_as_string() answers one. The receiver is still on the stack to
+     build it from, which is what the register below the one to_s was sent
+     to is kept for. */
+  if (!mrb_string_p(str)) str = mrb_any_to_s(mrb, args[1]);
+  return mrb_str_cat_str(mrb, args[0], str);
+}
+
+/* The frame prepare_exec_strcat() pushes, kept at file scope as the static
+   procs of class.c are. Before C++20 the cfunc proc cannot be built by a
+   designated initializer, so there MRB_MAKE_STATIC_PROC_FROM_FUNC() is a
+   call and the object is initialized when the program starts; inside the
+   function it would be initialized on the first call instead, behind a
+   guard every later call has to pass. */
+MRB_PRESYM_DEFINE_VAR_AND_INITER(prepare_exec_strcat_syms, 1, MRB_SYM(to_s))
+static const mrb_code prepare_exec_strcat_iseq[] = {
+  OP_MOVE,    3, 2,     // OP_MOVE      R3  R2
+  OP_SEND,    3, 0, 0,  // OP_SEND      R3  :to_s  n=0|nk=0
+  OP_CALL,              // OP_CALL      R0            ; tailcall to prepare_exec_strcat_post_func()
+  OP_RETURN,  0         // OP_RETURN    R0            ; unreachable
+};
+static const mrb_irep prepare_exec_strcat_irep = MRB_MAKE_STATIC_IREP(4, 5, prepare_exec_strcat_iseq, prepare_exec_strcat_syms);
+/* Both become an mrb_value, whose word-boxed form keeps the type tag in the
+   low bits of the pointer; the alignment a static object is given otherwise
+   is the compiler's to choose (see the static procs in proc.c and class.c,
+   aligned the same way). */
+mrb_alignas(8) static const struct RProc prepare_exec_strcat_proc = MRB_MAKE_STATIC_PROC_FROM_IREP(prepare_exec_strcat_irep);
+mrb_alignas(8) static const struct RProc prepare_exec_strcat_post_proc = MRB_MAKE_STATIC_PROC_FROM_FUNC(prepare_exec_strcat_post_func);
+
+static mrb_bool
+prepare_exec_strcat(mrb_state *mrb, uint32_t a)
+{
+  /*
+   *  call stack:
+   *    called:   [..., base]
+   *    returned: [..., base, strcat (, #to_s)]
+   *                            ^         ^--- called from strcat
+   *                            `--- invisible method-id
+   *
+   *  data stack:
+   *    called:   [..., string, any-object]
+   *
+   *    returned: [..., strcat_proc, string, any-object, any-object, implicit-block]
+   *                      ^                    ^           ^           ^--- nil
+   *                      |                    |           `--- receiver for #to_s, replaced by what it answers
+   *                      |                    `--- the same object, kept for the default representation
+   *                      |                         when #to_s answers no string
+   *                      `--- calls #to_s and then tailcalls prepare_exec_strcat_post_func()
+   */
+
+  MRB_PRESYM_INIT_SYMBOLS(mrb, prepare_exec_strcat_syms);
+
+  mrb_callinfo *ci = mrb->c->ci;
+  const struct RProc *strcat_proc = &prepare_exec_strcat_proc;
+#ifdef MRB_USE_REFINEMENTS
+  struct RArray *refscope = mrb_vm_refinements(mrb, ci);
+  if (refscope) {
+    struct RProc *refined_strcat_proc = (struct RProc*)mrb_obj_alloc_core(mrb, MRB_TT_PROC, mrb->proc_class);
+    refined_strcat_proc->body.irep = &prepare_exec_strcat_irep;
+    mrb_proc_set_refscope(mrb, refined_strcat_proc, refscope);
+    strcat_proc = refined_strcat_proc;
+  }
+#endif // MRB_USE_REFINEMENTS
+
+  ci = cipush(mrb, a, CINFO_DIRECT, mrb->object_class, NULL, NULL, 0, 3);
+  stack_extend(mrb, 5); // before expansion, ensure that the two objects are protected on the data stack
+  ci->stack[4] = mrb_nil_value();
+  ci->stack[3] = ci->stack[1];
+  ci->stack[2] = ci->stack[1];
+  ci->stack[1] = ci->stack[0];
+  ci->stack[0] = mrb_obj_value((void*)&prepare_exec_strcat_post_proc);
+  ci->cci = CINFO_NONE;
+  ci->proc = strcat_proc;
+  ci->pc = prepare_exec_strcat_iseq;
+
+  return TRUE;
+}
+
 #define RBREAK_TAG_FOREACH(f) \
   f(RBREAK_TAG_BREAK, 0) \
   f(RBREAK_TAG_JUMP, 1) \
@@ -3231,6 +3319,9 @@ mrb_vm_exec(mrb_state *mrb, const struct RProc *begin_proc, const mrb_code *iseq
   uint16_t c;
   mrb_sym mid;
   const struct mrb_irep_catch_handler *ch;
+  mrb_int acc;
+  mrb_value retval;
+  mrb_callinfo *return_ci;
 
 #ifndef MRB_USE_VM_SWITCH_DISPATCH
   static const void * const optable[] = {
@@ -3293,13 +3384,19 @@ RETRY_TRY_BLOCK:
         VM_SET_INT_VALUE(regs[a], (mrb_int)irep->pool[b].u.i64);
         break;
 #else
-#if defined(MRB_64BIT)
         if (INT32_MIN <= irep->pool[b].u.i64 && irep->pool[b].u.i64 <= INT32_MAX) {
           VM_SET_INT_VALUE(regs[a], (mrb_int)irep->pool[b].u.i64);
           break;
         }
-#endif
+#ifdef MRB_USE_BIGINT
+        /* a literal past mrb_int, written by an mrbc whose integers are
+           64 bits wide: the Integer it names, as IREP_TT_BIGINT gives */
+        regs[a] = mrb_bint_new_int64(mrb, irep->pool[b].u.i64);
+        mrb_gc_arena_restore(mrb, ai);
+        break;
+#else
         goto L_INT_OVERFLOW;
+#endif
 #endif
       case IREP_TT_BIGINT:
 #ifdef MRB_USE_BIGINT
@@ -3312,10 +3409,14 @@ RETRY_TRY_BLOCK:
 #else
         goto L_INT_OVERFLOW;
 #endif
-#ifndef MRB_NO_FLOAT
       case IREP_TT_FLOAT:
+#ifndef MRB_NO_FLOAT
         VM_SET_FLOAT_VALUE(regs[a], irep->pool[b].u.f);
         break;
+#else
+        /* a float literal in bytecode an mrbc with Float wrote: what does
+           not reach it runs, and this is where it cannot go on */
+        RAISE_LIT(mrb, E_NOTIMP_ERROR, "floating-point numbers are not supported");
 #endif
       default:
         /* should not happen (tt:string) */
@@ -4124,44 +4225,40 @@ RETRY_TRY_BLOCK:
       goto L_RETURN_FALSE;
     }
     CASE(OP_RETURN, B) {
-      mrb_int acc;
-      mrb_value v;
-      mrb_callinfo *return_ci;
-
-      v = regs[a];
+      retval = regs[a];
       goto L_RETURN;
     L_RETURN_NIL:
-      v = mrb_nil_value();
+      retval = mrb_nil_value();
       goto L_RETURN;
     L_RETURN_TRUE:
-      v = mrb_true_value();
+      retval = mrb_true_value();
       goto L_RETURN;
     L_RETURN_FALSE:
-      v = mrb_false_value();
+      retval = mrb_false_value();
     L_RETURN:
       /* cipop below may allocate (env unshare), and the returning frame's
          slots are no longer scanned after the pop, so keep a heap return
          value in the arena; immediates need no protection and skipping the
          call matters on integer-heavy return paths */
-      if (!mrb_immediate_p(v)) mrb_gc_protect(mrb, v);
+      if (!mrb_immediate_p(retval)) mrb_gc_protect(mrb, retval);
       return_ci = ci;
       CHECKPOINT_RESTORE(RBREAK_TAG_BREAK) {
         if (TRUE) {
           struct RBreak *brk = (struct RBreak*)mrb->exc;
           return_ci = &mrb->c->cibase[brk->ci_break_index];
-          v = mrb_break_value_get(brk);
+          retval = mrb_break_value_get(brk);
         }
         else {
         L_UNWINDING:
           return_ci = ci;
           ci = mrb->c->ci;
-          v = ci->stack[a];
+          retval = ci->stack[a];
         }
-        if (!mrb_immediate_p(v)) mrb_gc_protect(mrb, v);
+        if (!mrb_immediate_p(retval)) mrb_gc_protect(mrb, retval);
       }
       CHECKPOINT_MAIN(RBREAK_TAG_BREAK) {
         for (;;) {
-          UNWIND_ENSURE(mrb, ci, ci->pc, RBREAK_TAG_BREAK, return_ci, v);
+          UNWIND_ENSURE(mrb, ci, ci->pc, RBREAK_TAG_BREAK, return_ci, retval);
 
           if (ci == return_ci) {
             break;
@@ -4169,7 +4266,7 @@ RETRY_TRY_BLOCK:
           ci = cipop(mrb);
           if (ci[1].cci != CINFO_NONE) {
             mrb_assert(prev_jmp != NULL);
-            mrb->exc = (struct RObject*)break_new(mrb, RBREAK_TAG_BREAK, return_ci, v);
+            mrb->exc = (struct RObject*)break_new(mrb, RBREAK_TAG_BREAK, return_ci, retval);
             mrb_gc_arena_restore(mrb, ai);
             mrb->c->vmexec = FALSE;
             mrb->jmp = prev_jmp;
@@ -4186,7 +4283,7 @@ RETRY_TRY_BLOCK:
           /* toplevel return */
           mrb_gc_arena_restore(mrb, ai);
           mrb->jmp = prev_jmp;
-          return v;
+          return retval;
         }
 
 #ifdef MRB_USE_TASK_SCHEDULER
@@ -4194,7 +4291,7 @@ RETRY_TRY_BLOCK:
           mrb_gc_arena_restore(mrb, ai);
           mrb->jmp = prev_jmp;
           TASK_STOP(mrb);
-          return v;
+          return retval;
         }
 #endif
 
@@ -4204,7 +4301,7 @@ RETRY_TRY_BLOCK:
           mrb_gc_arena_restore(mrb, ai);
           c->vmexec = FALSE;
           mrb->jmp = prev_jmp;
-          return v;
+          return retval;
         }
         ci = mrb->c->ci;
       }
@@ -4213,19 +4310,19 @@ RETRY_TRY_BLOCK:
         mrb_gc_arena_restore(mrb, ai);
         mrb->c->vmexec = FALSE;
         mrb->jmp = prev_jmp;
-        return v;
+        return retval;
       }
       acc = ci->cci;
       ci = cipop(mrb);
       if (acc == CINFO_SKIP || acc == CINFO_DIRECT) {
         mrb_gc_arena_restore(mrb, ai);
         mrb->jmp = prev_jmp;
-        return v;
+        return retval;
       }
       DEBUG(fprintf(stderr, "from :%s\n", mrb_sym_name(mrb, ci->mid)));
       irep = ci->proc->body.irep;
 
-      ci[1].stack[0] = v;
+      ci[1].stack[0] = retval;
       mrb_gc_arena_restore(mrb, ai);
       JUMP;
     }
@@ -4709,8 +4806,16 @@ RETRY_TRY_BLOCK:
 
     CASE(OP_STRCAT, B) {
       mrb_ensure_string_type(mrb, regs[a]);
-      mrb_str_concat(mrb, regs[a], regs[a+1]);
-      ci = mrb->c->ci;
+      mrb_value ret = mrb_obj_as_string_nomethod(mrb, regs[a+1]);
+      if (mrb_string_p(ret)) {
+        mrb_str_cat_str(mrb, regs[a], ret);
+      }
+      else {
+        prepare_exec_strcat(mrb, a);
+        ci = mrb->c->ci;
+        irep = ci->proc->body.irep;
+      }
+      mrb_gc_arena_restore(mrb, ai);
       NEXT;
     }
 

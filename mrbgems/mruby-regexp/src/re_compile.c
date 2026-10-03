@@ -13,6 +13,10 @@
 #include <mruby/string.h>
 #include <string.h>
 
+#ifdef RE_UNICODE_CTYPE
+#include "re_prop.h"
+#endif
+
 /* Class IDs are stored in re_inst.a (uint8_t), so at most 256 distinct
    character classes can be encoded.  Without this cap, class_capa
    (uint16_t) overflows on doubling past 32768 (8 -> 16 -> ... -> 32768
@@ -1037,18 +1041,14 @@ class_complement(re_compiler *c, re_charclass *cc)
   cc->range_capa = capa;
 }
 
-/* TRUE when every character the class can match is ASCII, so it always
-   consumes exactly one byte. Non-ASCII codepoint ranges, a type read off the
-   table and the utf8_any catch-all (set by \D, \W, \S, \H and [[:^ascii:]])
-   all admit multibyte characters, whose width is not known until match
-   time. */
-static mrb_bool
-class_is_ascii_only(const re_charclass *cc)
+/* The byte UTF-8 begins the character `cp` with. */
+static uint32_t
+utf8_lead_byte(uint32_t cp)
 {
-#ifdef RE_UNICODE_CTYPE
-  if (RE_CLASS_HAS_CTYPE(cc)) return FALSE;
-#endif
-  return cc->num_ranges == 0 && !cc->utf8_any;
+  if (cp < 0x80) return cp;
+  if (cp < 0x800) return 0xC0 | (cp >> 6);
+  if (cp < 0x10000) return 0xE0 | (cp >> 12);
+  return 0xF0 | (cp >> 18);
 }
 
 /* Set ASCII bits for a POSIX class name (e.g. "alpha") into a 128-bit map.
@@ -1426,6 +1426,246 @@ at_shorthand_class(const char *src, const char *end)
   }
 }
 
+/* Put the POSIX type `name` into the operand being read, or its complement
+   where `neg` says so: the members of [:name:] or [:^name:]. The ASCII of a
+   set ASCII defines goes to `ascii_set` rather than into the class; see
+   compile_charclass(). `drop`, where given, is ASCII the type is to hold
+   without, taken out before any complement is. FALSE where there is no type
+   of that name. */
+static mrb_bool
+class_add_posix(re_compiler *c, re_charclass *cc, re_charclass *ascii_set,
+                const char *name, size_t len, mrb_bool neg, const char *drop)
+{
+  uint8_t bits[16] = {0};
+  mrb_bool by_ascii;
+  uint16_t ctype;
+  if (!posix_class_bits(bits, name, len, &by_ascii, &ctype)) return FALSE;
+  for (; drop && *drop; drop++) {
+    bits[(uint8_t)*drop >> 3] &= (uint8_t)~(1u << (*drop & 7));
+  }
+  re_charclass *dst = by_ascii ? ascii_set : cc;
+  for (int i = 0; i < 128; i++) {
+    mrb_bool in = (bits[i >> 3] >> (i & 7)) & 1;
+    if (in != neg) class_set_bit(dst, (uint8_t)i);
+  }
+  /* Above ASCII a type is read off the table at match time, in either
+     polarity. A set ASCII defines holds nothing there, so its negation
+     holds everything there: [:^ascii:] is every character above ASCII
+     and every byte that is no character. Without the table, every
+     bracket is such a set. */
+#ifdef RE_UNICODE_CTYPE
+  if (ctype) {
+    /* The bracket joins as a union, which is another type the class
+       admits, and a class already holding an intersection of brackets
+       has no room to say that. */
+    if (cc->ctype_all | cc->ctype_none) {
+      compile_error(c, "this character class union is not supported");
+    }
+    if (neg) cc->ctype_no |= ctype;
+    else cc->ctype_yes |= ctype;
+  }
+  else if (neg) dst->utf8_any = TRUE;
+#else
+  (void)c;
+  if (neg) dst->utf8_any = TRUE;
+#endif
+  return TRUE;
+}
+
+/* ---- character properties ------------------------------------------------
+   \p{name}, and its complement \P{name} or \p{^name}. The POSIX names are
+   the brackets under another spelling and read as them, types and all. The
+   general categories and the emoji properties are spelled out as the ranges
+   re_prop.h holds for them, so the class that holds one is an ordinary list
+   of members by the time it is matched, and folds under /i as one. Those
+   need the table, which only a build classifying characters by Unicode has;
+   anywhere else they are refused, as every other property is. */
+
+/* Room for the longest name looked up, once normalized. */
+#define RE_PROP_NAME_MAX 24
+
+enum { RE_PROP_NONE, RE_PROP_POSIX, RE_PROP_GC, RE_PROP_EMOJI };
+
+/* The POSIX names, as [:name:] spells them and as a property name normalizes
+   to: \p{Alpha} is [[:alpha:]] and \p{XDigit} [[:xdigit:]]. */
+static const char *const prop_posix_names[] = {
+  "alpha", "alnum", "word", "space", "upper", "lower", "digit",
+  "punct", "graph", "print", "blank", "cntrl", "xdigit", "ascii",
+};
+
+#ifdef RE_UNICODE_CTYPE
+/* TRUE where `raw`, normalized, is `norm`. */
+static mrb_bool
+prop_name_is(const char *norm, const char *raw)
+{
+  for (; *raw; raw++) {
+    char ch = *raw;
+    if (ch == '_') continue;
+    if (ch >= 'A' && ch <= 'Z') ch += 32;
+    if (*norm++ != ch) return FALSE;
+  }
+  return *norm == '\0';
+}
+#endif
+
+/* What the property `name` is, with its name normalized into `norm`: CRuby
+   reads one without regard to case or to '_', '-' and ' ', and so does this.
+   For a category the members are `*want` as a mask of the categories it
+   holds, a letter standing for every category it begins; for an emoji
+   property they are its bit. */
+static int
+prop_lookup(const char *name, size_t len, char *norm, uint32_t *want)
+{
+  size_t n = 0;
+  for (size_t i = 0; i < len; i++) {
+    char ch = name[i];
+    if (ch == '_' || ch == '-' || ch == ' ') continue;
+    if (n == RE_PROP_NAME_MAX) return RE_PROP_NONE;
+    norm[n++] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+  }
+  norm[n] = '\0';
+  for (size_t i = 0; i < sizeof(prop_posix_names) / sizeof(prop_posix_names[0]); i++) {
+    if (strcmp(norm, prop_posix_names[i]) == 0) return RE_PROP_POSIX;
+  }
+#ifdef RE_UNICODE_CTYPE
+  if (n == 1 || n == 2) {
+    uint32_t m = 0;
+    for (int i = 0; i < RE_PROP_GC_COUNT; i++) {
+      const char *gc = re_prop_gc_names[i];
+      if (gc[0] + 32 == norm[0] && (n == 1 || gc[1] == norm[1])) m |= (uint32_t)1 << i;
+    }
+    if (m) {
+      *want = m;
+      return RE_PROP_GC;
+    }
+  }
+  for (int i = 0; i < RE_PROP_EMOJI_COUNT; i++) {
+    if (prop_name_is(norm, re_prop_emoji_names[i])) {
+      *want = (uint32_t)1 << i;
+      return RE_PROP_EMOJI;
+    }
+  }
+#else
+  (void)want;
+#endif
+  return RE_PROP_NONE;
+}
+
+#ifdef RE_UNICODE_CTYPE
+/* The codepoints lo to hi join the class: the ASCII among them in the bitmap,
+   the rest as a range. The surrogates spell no character, so they are left
+   out of whatever holds them. */
+static void
+class_add_span(re_compiler *c, re_charclass *cc, uint32_t lo, uint32_t hi)
+{
+  if (lo < 128) {
+    class_set_range(cc, (uint8_t)lo, (uint8_t)(hi < 128 ? hi : 127));
+    if (hi < 128) return;
+    lo = 128;
+  }
+  if (lo <= 0xDFFF && hi >= 0xD800) {
+    if (lo < 0xD800) class_add_range(c, cc, lo, 0xD7FF);
+    if (hi > 0xDFFF) class_add_range(c, cc, 0xE000, hi);
+    return;
+  }
+  class_add_range(c, cc, lo, hi);
+}
+
+/* The runs of one of re_prop.h's tables that `want` admits join the class.
+   A run's value is one category where `set` is FALSE, which `want` holds as a
+   bit, and a set of properties where it is TRUE, any of which will do. The
+   runs ascend, so every range lands at the end of the list. */
+static void
+class_add_runs(re_compiler *c, re_charclass *cc, const uint32_t *runs, size_t count,
+               int bits, uint32_t want, mrb_bool set)
+{
+  for (size_t i = 0; i < count; i++) {
+    uint32_t v = runs[i] & (((uint32_t)1 << bits) - 1);
+    if (set ? (v & want) == 0 : ((want >> v) & 1) == 0) continue;
+    uint32_t lo = runs[i] >> bits;
+    uint32_t hi = i + 1 < count ? (runs[i + 1] >> bits) - 1 : 0x10FFFF;
+    class_add_span(c, cc, lo, hi);
+  }
+}
+#endif
+
+/* Read the property at c->p, which stands on the 'p' or 'P' of the escape,
+   into the operand whose class is `id`: the members a nested class holding
+   the property alone would bring, [\p{Lu}] joining as [[:upper:]]-like types
+   or ranges and \P{Lu} as the complement [^\p{Lu}] is. The ASCII of a set
+   ASCII defines goes to `ascii_set`, as the bracket's does.
+
+   With `negated` given, a complement is not taken but answered there, and
+   the property joins as written: a property outside a class is its own
+   class, which negates at match time as [^\p{Lu}] does. That is what makes
+   \P{Lu} under /i reject every cased letter, as it does in CRuby, where
+   [\P{Lu}] under /i closes the complement and accepts them all.
+
+   A category or an emoji property is spelled out in a class of its own, added
+   to the table for the time it takes, so that an error or a refused
+   allocation leaves nothing the pattern's release would not find. That can
+   move the table: a caller holding a pointer into it takes it again. */
+static void
+class_add_property(re_compiler *c, uint16_t id, re_charclass *ascii_set,
+                   mrb_bool *negated)
+{
+  mrb_bool neg = next_char(c) == 'P';
+  next_char(c);  /* '{' */
+  if (peek(c) == '^') {
+    next_char(c);
+    neg = !neg;
+  }
+  const char *name = c->p;
+  while (peek(c) >= 0 && peek(c) != '}') next_char(c);
+  if (peek(c) < 0) compile_error(c, "invalid character property name");
+  size_t len = (size_t)(c->p - name);
+  next_char(c);  /* '}' */
+  if (negated) {
+    *negated = neg;
+    neg = FALSE;
+  }
+
+  char norm[RE_PROP_NAME_MAX + 1];
+  uint32_t want = 0;
+  int kind = prop_lookup(name, len, norm, &want);
+  if (kind == RE_PROP_POSIX) {
+    /* \p{Punct} is the punctuation categories, where [[:punct:]] holds the
+       ASCII symbols as well, in CRuby as here. Above ASCII the two agree. */
+    const char *drop = strcmp(norm, "punct") == 0 ? "$+<=>^`|~" : NULL;
+    class_add_posix(c, &c->pat->classes[id], ascii_set, norm, strlen(norm), neg, drop);
+    return;
+  }
+#ifdef RE_UNICODE_CTYPE
+  if (kind != RE_PROP_NONE) {
+    uint16_t tmp = add_class(c);
+    re_charclass *set = &c->pat->classes[tmp];
+    if (kind == RE_PROP_GC) {
+      class_add_runs(c, set, re_prop_gc_runs, RE_PROP_GC_RUN_COUNT,
+                     RE_PROP_GC_BITS, want, FALSE);
+    }
+    else {
+      class_add_runs(c, set, re_prop_emoji_runs, RE_PROP_EMOJI_RUN_COUNT,
+                     RE_PROP_EMOJI_BITS, want, TRUE);
+    }
+    if (neg) class_complement(c, set);
+    class_union(c, &c->pat->classes[id], set);
+    drop_class(c, tmp);
+    return;
+  }
+#endif
+  compile_error_str(c, mrb_format(c->mrb, "character property {%l} is not supported",
+                                  name, len));
+}
+
+/* TRUE where the text at `src` is a braced property escape, \p{...} or
+   \P{...}. A bare \p is the letter, in CRuby as here. */
+static mrb_bool
+at_property(const char *src, const char *end)
+{
+  return end - src > 2 && src[0] == '\\' && (src[1] == 'p' || src[1] == 'P') &&
+         src[2] == '{';
+}
+
 /* A shorthand and a POSIX bracket each name a set, so neither can be an end
    of a range. Called where one has just been folded in: a '-' after it opens
    a range this class cannot have, and CRuby reports that '-' rather than
@@ -1549,9 +1789,10 @@ at_intersection(const char *p, const char *end)
 static int
 parse_class_operand(re_compiler *c, re_class_level *lv)
 {
-  /* Nothing an operand holds adds a class, and a nest is reported before one
-     is opened, so the table cannot move under this pointer while the operand
-     is read. */
+  /* A nest is reported before its class is opened, and the one thing an
+     operand holds that adds a class, a property, gives it back before it
+     returns and has this pointer taken afresh after it, so the table does not
+     move under it while the operand is read. */
   re_charclass *cc = &c->pat->classes[lv->cur_id];
   re_charclass *ascii_set = &lv->ascii_set;
 
@@ -1589,39 +1830,11 @@ parse_class_operand(re_compiler *c, re_class_level *lv)
       const char *name = c->p;
       while (peek(c) >= 0 && peek(c) != ':' && peek(c) != ']') next_char(c);
       if (peek(c) == ':' && c->p + 1 < c->src_end && c->p[1] == ']') {
-        uint8_t bits[16] = {0};
-        mrb_bool by_ascii;
-        uint16_t ctype;
-        if (!posix_class_bits(bits, name, (size_t)(c->p - name), &by_ascii, &ctype)) {
+        if (!class_add_posix(c, cc, ascii_set, name, (size_t)(c->p - name), neg, NULL)) {
           compile_error(c, "invalid POSIX bracket type");
         }
         next_char(c);  /* ':' */
         next_char(c);  /* ']' */
-        re_charclass *dst = by_ascii ? ascii_set : cc;
-        for (int i = 0; i < 128; i++) {
-          mrb_bool in = (bits[i >> 3] >> (i & 7)) & 1;
-          if (in != neg) class_set_bit(dst, (uint8_t)i);
-        }
-        /* Above ASCII a type is read off the table at match time, in either
-           polarity. A set ASCII defines holds nothing there, so its negation
-           holds everything there: [:^ascii:] is every character above ASCII
-           and every byte that is no character. Without the table, every
-           bracket is such a set. */
-#ifdef RE_UNICODE_CTYPE
-        if (ctype) {
-          /* The bracket joins as a union, which is another type the class
-             admits, and a class already holding an intersection of brackets
-             has no room to say that. */
-          if (cc->ctype_all | cc->ctype_none) {
-            compile_error(c, "this character class union is not supported");
-          }
-          if (neg) cc->ctype_no |= ctype;
-          else cc->ctype_yes |= ctype;
-        }
-        else if (neg) dst->utf8_any = TRUE;
-#else
-        if (neg) dst->utf8_any = TRUE;
-#endif
         reject_set_as_range_start(c);
         continue;
       }
@@ -1639,11 +1852,12 @@ parse_class_operand(re_compiler *c, re_class_level *lv)
        stay intact. */
     if (peek(c) == '\\') {
       int esc = (c->p + 1 < c->src_end) ? (uint8_t)c->p[1] : -1;
-      /* The engine reads no character property, and the members below would
-         make one of every letter of the name: [\p{Han}] would hold H, a and
-         n. Refused rather than answered with the text of the request. */
-      if ((esc == 'p' || esc == 'P') && c->p + 2 < c->src_end && c->p[2] == '{') {
-        compile_error(c, "character property is not supported");
+      if (at_property(c->p, c->src_end)) {
+        next_char(c);  /* '\\' */
+        class_add_property(c, lv->cur_id, ascii_set, NULL);
+        cc = &c->pat->classes[lv->cur_id];
+        reject_set_as_range_start(c);
+        continue;
       }
       if (esc == 'd' || esc == 'D' || esc == 'w' || esc == 'W' ||
           esc == 's' || esc == 'S' || esc == 'h' || esc == 'H') {
@@ -1668,7 +1882,7 @@ parse_class_operand(re_compiler *c, re_class_level *lv)
          letter, so [a-\d] was [a-d], a class of four letters rather than the
          error CRuby reports. A POSIX bracket in that place is caught by the
          backwards-range check below, since its '[' sorts under every letter. */
-      if (at_shorthand_class(c->p, c->src_end)) {
+      if (at_shorthand_class(c->p, c->src_end) || at_property(c->p, c->src_end)) {
         compile_error(c, "char-class value at end of range");
       }
       /* A nested class names a set too, and CRuby answers one in that place
@@ -1807,6 +2021,8 @@ parse_class_levels(re_compiler *c, uint16_t id, uint8_t *cross)
   }
 }
 
+static void finish_charclass(re_compiler *c, uint16_t id, uint8_t *cross, mrb_bool negated);
+
 /* Parse [...] character class */
 static void
 compile_charclass(re_compiler *c)
@@ -1829,6 +2045,15 @@ compile_charclass(re_compiler *c)
      the letters left in [b-z&&\w] are cased like any others. */
   uint8_t cross[RE_CLASS_BITMAP_SIZE];
   parse_class_levels(c, id, cross);
+  finish_charclass(c, id, cross, negated);
+}
+
+/* Close class `id` under /i and emit it: the class a bracket expression or a
+   property outside one compiles to, once everything written in it is there.
+   `cross` is the ASCII it holds in its own right; see compile_charclass(). */
+static void
+finish_charclass(re_compiler *c, uint16_t id, uint8_t *cross, mrb_bool negated)
+{
   re_charclass *cc = &c->pat->classes[id];
 
   /* Close the class under case folding for /i. This runs once the class is
@@ -1964,6 +2189,24 @@ compile_charclass(re_compiler *c)
 
   cc->negated = negated;
   emit(c, negated ? RE_NCLASS : RE_CLASS, (uint8_t)id, 0);
+}
+
+/* A property outside a class, at c->p on its 'p' or 'P': the class holding it
+   alone, which is what \p{Lu} and [\p{Lu}] both compile to, and \P{Lu} what
+   [^\p{Lu}] does. */
+static void
+compile_property(re_compiler *c)
+{
+  uint16_t id = add_class(c);
+  re_charclass ascii_set;
+  mrb_bool negated;
+  memset(&ascii_set, 0, sizeof(ascii_set));
+  class_add_property(c, id, &ascii_set, &negated);
+  re_charclass *cc = &c->pat->classes[id];
+  uint8_t cross[RE_CLASS_BITMAP_SIZE];
+  memcpy(cross, cc->bitmap, RE_CLASS_BITMAP_SIZE);
+  class_join_ascii_set(cc, &ascii_set);
+  finish_charclass(c, id, cross, negated);
 }
 
 /* Maximum value for {n}/{n,m} quantifiers. Each unit becomes (min-1) +
@@ -3630,13 +3873,9 @@ compile_atom(re_compiler *c)
       compile_error_str(c, mrb_format(c->mrb, "\\\\%c is not supported", (char)ch));
     }
     else if ((ch == 'p' || ch == 'P') && c->p + 1 < c->src_end && c->p[1] == '{') {
-      /* The engine reads no character property. Without this the escape is
-         the letter it names and the braces are literal too, so /\p{Alpha}/
-         would answer a pattern that asked for a letter with the text of the
-         request. `[[:alpha:]]` is how to ask for one; see README.md.
-         Only the braced spelling is a property: CRuby reads a bare `\p`, and
+      /* Only the braced spelling is a property: CRuby reads a bare `\p`, and
          `\pL` as well, as the letter, and so does the fall-through below. */
-      compile_error(c, "character property is not supported");
+      compile_property(c);
     }
     else if (ch == 'u') {
       next_char(c);  /* skip u */
@@ -4596,10 +4835,47 @@ walk_room(mrb_state *mrb, uint32_t n)
   return (uint32_t*)mrb_malloc_simple(mrb, (size_t)n * (sizeof(uint32_t) + 1));
 }
 
+/* Put the bytes a character of the class can begin with into `bm`, all 256
+   of them. A codepoint member begins with the lead byte UTF-8 spells it with,
+   which rises with the codepoint, so a range's leads are the run between its
+   ends'; a byte member (RE_CLASS_BYTE) is the byte itself. The set is only
+   ever a superset: a lead of a codepoint the subject cannot hold (a
+   byte-indexed one) costs a proposal and nothing more, and a byte the scan
+   finds inside a character is refused by the search's interior test. FALSE
+   where the class answers by type, which has no range to read. */
+static mrb_bool
+class_first_bytes(const re_charclass *cc, uint8_t *bm)
+{
+  for (int i = 0; i < 16; i++) bm[i] |= cc->bitmap[i];
+#ifdef RE_UNICODE_CTYPE
+  if (RE_CLASS_HAS_CTYPE(cc)) return FALSE;
+#endif
+  if (cc->utf8_any) {
+    memset(bm + 16, 0xff, 16);
+    return TRUE;
+  }
+  for (uint32_t i = 0; i < cc->num_ranges; i++) {
+    uint32_t lo = cc->ranges[2*i], hi = cc->ranges[2*i + 1];
+    uint32_t b, e;
+    if (lo & RE_CLASS_BYTE) {
+      b = lo & 0xff;
+      e = hi & 0xff;
+    }
+    else {
+      b = utf8_lead_byte(lo);
+      e = utf8_lead_byte(hi > 0x10FFFF ? 0x10FFFF : hi);
+    }
+    for (; b <= e; b++) bm[b >> 3] |= (uint8_t)(1 << (b & 7));
+  }
+  return TRUE;
+}
+
 /*
  * Compute the set of bytes that could be the first consumed byte of a match.
  * Walks bytecode from pc=0, following epsilon transitions (SAVE, JMP, SPLIT).
  * Returns TRUE if the set is narrower than "any byte" (i.e., useful for skip).
+ * `bm` covers all 256 bytes; see class_first_bytes() for why a byte above
+ * 127 in it is safe to scan for.
  *
  * Every path has to answer TRUE for the set to be one, so a path that
  * answers FALSE ends the walk there; the others put their bytes in `bm` and
@@ -4645,17 +4921,12 @@ first_set_walk(const re_inst *code, uint32_t code_len,
         pc = pc + 1;
         continue;
       case RE_BYTE:
-        return FALSE;  /* always non-ASCII: bm covers ASCII only */
       case RE_CHAR:
-        if (code[pc].a >= 128) return FALSE;  /* non-ASCII: bm covers ASCII only */
-        bm[code[pc].a >> 3] |= (1 << (code[pc].a & 7));
+        bm[code[pc].a >> 3] |= (uint8_t)(1 << (code[pc].a & 7));
         goto next;
-      case RE_CLASS: {
-        const re_charclass *cc = &classes[code[pc].a];
-        for (int i = 0; i < 16; i++) bm[i] |= cc->bitmap[i];
-        if (!class_is_ascii_only(cc)) return FALSE;  /* non-ASCII possible */
+      case RE_CLASS:
+        if (!class_first_bytes(&classes[code[pc].a], bm)) return FALSE;
         goto next;
-      }
       case RE_NCLASS: {
         /* negated class: complement of bitmap. Too many bits; not useful. */
         return FALSE;
@@ -4924,12 +5195,12 @@ compute_first_set(mrb_state *mrb, const re_inst *code, uint32_t code_len,
   if (!narrow) return FALSE;
   /* Check if bitmap is all-ones (no benefit to skip) */
   int set_bits = 0;
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < 32; i++) {
     for (int b = 0; b < 8; b++) {
       if (bm[i] & (1 << b)) set_bits++;
     }
   }
-  return set_bits < 96;  /* useful only if fewer than 75% of bytes match */
+  return set_bits < 192;  /* useful only if fewer than 75% of bytes match */
 }
 
 /* ---- subexpression calls -------------------------------------------------
@@ -5442,19 +5713,20 @@ mrb_re_compile(mrb_state *mrb, mrb_regexp_pattern *pat,
      Used when prefix is empty (e.g. alternation, character class patterns). */
   pat->has_first_bytes = FALSE;
   if (pat->anchor != RE_ANCHOR_BOT) {
-    uint8_t bm[16];
+    uint8_t bm[32];
     memset(bm, 0, sizeof(bm));
     pat->has_first_bytes = compute_first_set(mrb, pat->code, code_len,
                                              pat->classes, bm);
     if (pat->has_first_bytes) {
-      memcpy(pat->first_bytes, bm, 16);
+      memcpy(pat->first_bytes, bm, sizeof(bm));
       /* A set of up to three bytes is also kept enumerated, so the skip can
          ask memchr for each member instead of walking the subject a byte at
          a time; see skip_to_first_byte(). Three covers the common shapes: an
-         alternation on one letter is one byte and a case-folded letter under
-         /i is two. */
+         alternation on one letter is one byte, a case-folded letter under /i
+         is two, and three with the lead of a counterpart outside ASCII ('k'
+         and U+212A KELVIN SIGN). */
       int n = 0;
-      for (int b = 0; b < 128; b++) {
+      for (int b = 0; b < 256; b++) {
         if (bm[b >> 3] & (1 << (b & 7))) {
           if (n == 3) { n = 0; break; }
           pat->first_byte[n++] = (uint8_t)b;

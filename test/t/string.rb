@@ -1502,6 +1502,77 @@ assert('String interpolation (mrb_str_concat for shared strings)') do
   assert_equal "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:", "#{a}:"
 end
 
+assert('String interpolation calls #to_s') do
+  k = Class.new { def to_s; "called"; end }
+  assert_equal "x called", "x #{k.new}"
+
+  # A to_s that answers no String is not taken at its word: the object gets
+  # the default representation instead, as a conversion to String does
+  # everywhere else.
+  bad = Class.new { def to_s; 42; end }
+  assert_equal "#<", "#{bad.new}"[0, 2]
+  nils = Class.new { def to_s; nil; end }
+  assert_equal "#<", "#{nils.new}"[0, 2]
+
+  # An exception out of to_s is raised from the interpolation, not swallowed.
+  boom = Class.new { def to_s; raise "boom"; end }
+  assert_raise(RuntimeError) { "#{boom.new}" }
+
+  # Interpolations nest, and the types converted without a call are spelled
+  # the way a to_s of their own would spell them.
+  assert_equal "a1b", "a#{"#{1}"}b"
+  assert_equal "1 sym  Integer", "#{1} #{:sym} #{nil} #{Integer}"
+  assert_equal "true false", "#{true} #{false}"
+  assert_equal "1.5 Infinity NaN", "#{1.5} #{1.0 / 0} #{0.0 / 0.0}" if 1.respond_to?(:to_f)
+end
+
+assert('String interpolation spells a built-in value itself') do
+  # A value is spelled by what it is, with the C function the type's own
+  # to_s is: an override on one of those core classes is not read back, as
+  # mruby's other C paths over built-ins do not read one either. An object
+  # answers for itself instead (see below).
+  assert_equal "1 s  true false", "#{1} #{:s} #{nil} #{true} #{false}"
+  assert_equal "1.5", "#{1.5}" if 1.respond_to?(:to_f)
+
+  # An integer too wide to store inline is spelled here too. The shift count
+  # is a variable because a constant shift out of mrb_int range makes the
+  # build fail rather than raise, and the whole thing is guarded because a
+  # build without mruby-bigint has no such integer to spell.
+  begin
+    k = 100
+    big = 1 << k
+    assert_equal "1267650600228229401496703205376", "#{big}"
+    assert_equal big.to_s, "#{big}"
+  rescue RangeError
+  end
+
+  # The same spelling every path uses, so a join, a format and an
+  # interpolation cannot drift apart.
+  vals = [1, :s, nil, true, false]
+  assert_equal vals.map { |v| "#{v}" }.join(","), vals.join(",")
+end
+
+assert('String interpolation asks a class what it spells') do
+  # A class is an object, not a value: `def self.to_s` is a method on one
+  # object rather than an override of a core class, so it is answered.
+  k = Class.new { def self.to_s; "named"; end }
+  assert_equal "a named", "a #{k}"
+  assert_equal "named", [k].join
+  m = Module.new { def self.to_s; "mod"; end }
+  assert_equal "mod", "#{m}"
+
+  # A class that says nothing of its own is still spelled by its path.
+  assert_equal "Integer", "#{Integer}"
+
+  # Naming a class in a message does not go through that method: the message
+  # is built while an exception is raised, which is no place to run Ruby.
+  begin
+    k.new.no_such_method
+  rescue NoMethodError => e
+    assert_false e.message.include?("named")
+  end
+end
+
 assert('String#bytes') do
   str1 = "hello"
   bytes1 = [104, 101, 108, 108, 111]

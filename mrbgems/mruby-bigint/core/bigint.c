@@ -562,7 +562,11 @@ mpz_add_int(mpz_ctx_t *ctx, mpz_t *x, mrb_int n)
   if (carry != 0) {
     mpz_realloc(ctx, x, x->sz + 1);
     x->p[x->sz-1] = (mp_limb)carry;
-    x->sn = 1;
+    /* the magnitude grew; keep the sign the caller set (the routine "ignores
+       sign of x"). Forcing it positive here turned a magnitude-growing step on
+       a negative value positive, so mrb_bint_sub_n()/add_n() gave the wrong
+       sign whenever the carry crossed a limb, e.g. -(2**64-1) - 1. */
+    if (x->sn == 0) x->sn = 1;
   }
   trim(x);
 }
@@ -1260,10 +1264,54 @@ mpn_neg(mp_limb *rp, const mp_limb *ap, size_t n)
 {
   mp_limb carry = 1;
   for (size_t i = 0; i < n; i++) {
-    mp_dbl_limb sum = (mp_dbl_limb)(~ap[i]) + carry;
+    /* ~ promotes a limb narrower than int, and the complement of the
+       promoted value carries ones above the limb into the sum */
+    mp_dbl_limb sum = (mp_dbl_limb)(mp_limb)~ap[i] + carry;
     rp[i] = LOW(sum);
     carry = HIGH(sum);
   }
+}
+
+/* Evaluate x0 + 2*x1 + 4*x2 into rp[0..n); returns trimmed length (>= 1) */
+static size_t
+mpn_toom3_eval2(mp_limb *rp, size_t n,
+                const mp_limb *x0, size_t x0_len,
+                const mp_limb *x1, size_t x1_len,
+                const mp_limb *x2, size_t x2_len)
+{
+  mpn_zero(rp, n);
+  mpn_copyi(rp, x0, x0_len);
+  /* Add 2*x1 */
+  if (x1_len > 0) {
+    mp_limb carry = 0;
+    for (size_t i = 0; i < x1_len; i++) {
+      mp_dbl_limb val = (mp_dbl_limb)rp[i] + ((mp_dbl_limb)x1[i] << 1) + carry;
+      rp[i] = LOW(val);
+      carry = HIGH(val);
+    }
+    for (size_t i = x1_len; carry && i < n; i++) {
+      mp_dbl_limb val = (mp_dbl_limb)rp[i] + carry;
+      rp[i] = LOW(val);
+      carry = HIGH(val);
+    }
+  }
+  /* Add 4*x2 */
+  if (x2_len > 0) {
+    mp_limb carry = 0;
+    for (size_t i = 0; i < x2_len; i++) {
+      mp_dbl_limb val = (mp_dbl_limb)rp[i] + ((mp_dbl_limb)x2[i] << 2) + carry;
+      rp[i] = LOW(val);
+      carry = HIGH(val);
+    }
+    for (size_t i = x2_len; carry && i < n; i++) {
+      mp_dbl_limb val = (mp_dbl_limb)rp[i] + carry;
+      rp[i] = LOW(val);
+      carry = HIGH(val);
+    }
+  }
+  size_t len = n;
+  while (len > 0 && rp[len-1] == 0) len--;
+  return len ? len : 1;
 }
 
 /* Pool-aware Toom-3 multiplication */
@@ -1391,75 +1439,9 @@ mpz_mul_toom3(mpz_ctx_t *ctx, mp_limb *result,
   if (vm1_y_len == 0) vm1_y_len = 1;
 
   /* v2 = x0 + 2*x1 + 4*x2 */
-  {
-    mpn_zero(v2_x, eval_len);
-    mpn_copyi(v2_x, x0, x0_len);
-    /* Add 2*x1 */
-    if (x1_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < x1_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + ((mp_dbl_limb)x1[i] << 1) + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = x1_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-    /* Add 4*x2 */
-    if (x2_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < x2_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + ((mp_dbl_limb)x2[i] << 2) + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = x2_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-  }
-  size_t v2_x_len = eval_len;
-  while (v2_x_len > 0 && v2_x[v2_x_len-1] == 0) v2_x_len--;
-  if (v2_x_len == 0) v2_x_len = 1;
+  size_t v2_x_len = mpn_toom3_eval2(v2_x, eval_len, x0, x0_len, x1, x1_len, x2, x2_len);
 
-  {
-    mpn_zero(v2_y, eval_len);
-    mpn_copyi(v2_y, y0, y0_len);
-    if (y1_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < y1_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_y[i] + ((mp_dbl_limb)y1[i] << 1) + carry;
-        v2_y[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = y1_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_y[i] + carry;
-        v2_y[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-    if (y2_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < y2_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_y[i] + ((mp_dbl_limb)y2[i] << 2) + carry;
-        v2_y[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = y2_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_y[i] + carry;
-        v2_y[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-  }
-  size_t v2_y_len = eval_len;
-  while (v2_y_len > 0 && v2_y[v2_y_len-1] == 0) v2_y_len--;
-  if (v2_y_len == 0) v2_y_len = 1;
+  size_t v2_y_len = mpn_toom3_eval2(v2_y, eval_len, y0, y0_len, y1, y1_len, y2, y2_len);
 
   /*
    * Pointwise multiplication (5 recursive calls)
@@ -1732,39 +1714,7 @@ mpz_sqr_toom3(mpz_ctx_t *ctx, mp_limb *result,
   if (vm1_x_len == 0) vm1_x_len = 1;
 
   /* v2 = x0 + 2*x1 + 4*x2 */
-  {
-    mpn_zero(v2_x, eval_len);
-    mpn_copyi(v2_x, x0, x0_len);
-    if (x1_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < x1_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + ((mp_dbl_limb)x1[i] << 1) + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = x1_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-    if (x2_len > 0) {
-      mp_limb carry = 0;
-      for (size_t i = 0; i < x2_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + ((mp_dbl_limb)x2[i] << 2) + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-      for (size_t i = x2_len; carry && i < eval_len; i++) {
-        mp_dbl_limb val = (mp_dbl_limb)v2_x[i] + carry;
-        v2_x[i] = LOW(val);
-        carry = HIGH(val);
-      }
-    }
-  }
-  size_t v2_x_len = eval_len;
-  while (v2_x_len > 0 && v2_x[v2_x_len-1] == 0) v2_x_len--;
-  if (v2_x_len == 0) v2_x_len = 1;
+  size_t v2_x_len = mpn_toom3_eval2(v2_x, eval_len, x0, x0_len, x1, x1_len, x2, x2_len);
 
   /*
    * Pointwise squaring (5 recursive calls)
@@ -3102,10 +3052,10 @@ mpz_mod(mpz_ctx_t *ctx, mpz_t *r, mpz_t *x, mpz_t *y)
     return;
   }
 
-  /* Fast path for single-limb modulus */
+  /* Fast path for single-limb modulus; the remainder takes the sign of x,
+     as in the other paths, whatever the sign of y */
   if (y->sz == 1) {
     mpz_mod_limb(ctx, r, x, y->p[0]);
-    if (y->sn < 0) r->sn = -r->sn;
     return;
   }
 
@@ -3114,11 +3064,16 @@ mpz_mod(mpz_ctx_t *ctx, mpz_t *r, mpz_t *x, mpz_t *y)
    * violate it and the algorithm silently truncates high limbs. Fall through
    * to general division for those. */
   if (y->sz >= 4 && y->sz <= 16 && x->sz >= y->sz + 2 && x->sz <= 2 * y->sz) {
+    /* Barrett reads its operands as signed, so it is handed their
+       magnitudes, as the division below is: given a negative x it found
+       x < m and answered x unreduced. The sign goes on afterwards. */
+    mpz_t ax = *x, ay = *y;
     mpz_t mu;
+    ax.sn = ay.sn = 1;
     mpz_init_temp(ctx, &mu, y->sz + 1);
-    mpz_barrett_mu(ctx, &mu, y);
+    mpz_barrett_mu(ctx, &mu, &ay);
     mpz_realloc(ctx, r, y->sz);
-    mpz_barrett_reduce(ctx, r, x, y, &mu);
+    mpz_barrett_reduce(ctx, r, &ax, &ay, &mu);
     r->sn = sn;
     if (uzero_p(r))
       r->sn = 0;
@@ -5968,14 +5923,29 @@ mrb_bint_powm(mrb_state *mrb, mrb_value x, mrb_value exp, mrb_value mod)
     if (zero_p(&c) || uzero_p(&c)) {
       mrb_int_zerodiv(mrb);
     }
+    /* The limit mpz_powm() enforces, checked before the base is reduced
+       into a temporary as wide as the modulus: raised from in there, that
+       temporary was never freed. */
+    if ((size_t)c.sz * DIG_SIZE > MRB_BIGINT_BIT_LIMIT / 2) {
+      mrb_raise(mrb, E_RANGE_ERROR, "modulus too large");
+    }
     if (c.sn < 0) {
       neg_mod = TRUE;
       c.sn = 1;  /* use absolute value */
     }
   }
 
+  /* Take the base modulo |m|, into [0, |m|): the reductions below expect
+     that, and one that is negative or at least m**2 gave a wrong result. */
+  mpz_t r;
+  mpz_init(ctx, &r);
+  mpz_mod(ctx, &r, &a, &c);
+  if (r.sn < 0 && !uzero_p(&r)) {
+    mpz_add(ctx, &r, &r, &c);
+  }
+
   /* Check for zero base case: 0^n = 0 for n > 0 */
-  if (zero_p(&a) || uzero_p(&a)) {
+  if (zero_p(&r) || uzero_p(&r)) {
     mrb_bool exp_positive;
     if (mrb_bigint_p(exp)) {
       bint_as_mpz(RBIGINT(exp), &b);
@@ -5986,6 +5956,7 @@ mrb_bint_powm(mrb_state *mrb, mrb_value x, mrb_value exp, mrb_value mod)
     }
     if (exp_positive) {
       /* 0^n mod m = 0 for n > 0 */
+      mpz_clear(ctx, &r);
       if (mrb_integer_p(mod)) mpz_clear(ctx, &c);
       return mrb_fixnum_value(0);
     }
@@ -5995,13 +5966,14 @@ mrb_bint_powm(mrb_state *mrb, mrb_value x, mrb_value exp, mrb_value mod)
   if (mrb_bigint_p(exp)) {
     bint_as_mpz(RBIGINT(exp), &b);
     if (b.sn < 0) goto raise;
-    mpz_powm(ctx, &z, &a, &b, &c);
+    mpz_powm(ctx, &z, &r, &b, &c);
   }
   else {
     mrb_int e = mrb_integer(exp);
     if (e < 0) goto raise;
-    mpz_powm_i(ctx, &z, &a, e, &c);
+    mpz_powm_i(ctx, &z, &r, e, &c);
   }
+  mpz_clear(ctx, &r);
 
   /* Apply signed modulo adjustment for negative modulus */
   /* Ruby: result + m for non-zero result when m is negative */
@@ -6013,6 +5985,7 @@ mrb_bint_powm(mrb_state *mrb, mrb_value x, mrb_value exp, mrb_value mod)
   return bint_norm(mrb, bint_new(ctx, &z));
 
  raise:
+  mpz_clear(ctx, &r);
   if (mrb_integer_p(mod)) mpz_clear(ctx, &c);
   mrb_raise(mrb, E_ARGUMENT_ERROR, "int.pow(n,m): n must be positive");
   /* not reached */
@@ -6141,8 +6114,42 @@ mrb_bint_rev(mrb_state *mrb, mrb_value x)
   bint_as_mpz(RBIGINT(x), &a);
   mpz_init(ctx, &b);
   mpz_neg(ctx, &b, &a);
-  mpz_sub_int(ctx, &b, 1);
+  /* ~a is -a - 1. mpz_sub_int() and mpz_add_int() work on the magnitude,
+     so take 1 from it when -a is positive, and add 1 to it otherwise. */
+  if (b.sn > 0) {
+    mpz_sub_int(ctx, &b, 1);
+  }
+  else {
+    mpz_add_int(ctx, &b, 1);
+  }
   return bint_norm(mrb, bint_new(ctx, &b));
+}
+
+/* z = floor(x / 2^e), where mpz_div_2exp() truncates toward zero */
+static void
+mpz_fdiv_q_2exp(mpz_ctx_t *ctx, mpz_t *z, mpz_t *x, mrb_int e)
+{
+  mrb_bool down;
+
+#if MRB_INT_MAX > SIZE_MAX
+  if (e > (mrb_int)SIZE_MAX) {
+    /* wider than any Bigint, and than a size_t: only the sign is left */
+    mpz_set_int(ctx, z, x->sn < 0 ? -1 : 0);
+    return;
+  }
+#endif
+  /* a negative x that loses a set bit rounds one further down */
+  down = x->sn < 0 && mpz_trailing_zeros(x) < (size_t)e;
+
+  mpz_div_2exp(ctx, z, x, e);
+  if (down) {
+    if (zero_p(z)) {
+      mpz_set_int(ctx, z, -1);
+    }
+    else {
+      mpz_add_int(ctx, z, 1);   /* on the magnitude of a negative z */
+    }
+  }
 }
 
 mrb_value
@@ -6154,7 +6161,7 @@ mrb_bint_lshift(mrb_state *mrb, mrb_value x, mrb_int width)
   bint_as_mpz(RBIGINT(x), &a);
   mpz_init(ctx, &z);
   if (width < 0) {
-    mpz_div_2exp(ctx, &z, &a, -width);
+    mpz_fdiv_q_2exp(ctx, &z, &a, -width);
   }
   else {
     mpz_mul_2exp(ctx, &z, &a, width);
@@ -6174,7 +6181,7 @@ mrb_bint_rshift(mrb_state *mrb, mrb_value x, mrb_int width)
     mpz_mul_2exp(ctx, &z, &a, -width);
   }
   else {
-    mpz_div_2exp(ctx, &z, &a, width);
+    mpz_fdiv_q_2exp(ctx, &z, &a, width);
   }
   return bint_norm(mrb, bint_new(ctx, &z));
 }

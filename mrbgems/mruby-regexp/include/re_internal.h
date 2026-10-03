@@ -259,7 +259,7 @@ typedef struct mrb_regexp_pattern {
   mrb_bool needs_backtrack; /* true if pattern needs backtracking engine */
   uint8_t *prefix;         /* literal prefix bytes for fast skip (or NULL) */
   uint8_t prefix_len;      /* length of prefix (0 = no prefix) */
-  uint8_t first_bytes[16]; /* bitmap of possible first bytes (128-bit, ASCII) */
+  uint8_t first_bytes[32]; /* bitmap of possible first bytes, all 256 */
   mrb_bool has_first_bytes; /* true if first_bytes is usable for skipping */
   uint8_t first_byte_count; /* how many bytes first_byte[] holds (1..3), or 0
                                when the set is wider and only the bitmap
@@ -565,7 +565,10 @@ mrb_bool mrb_re_needs_case_data(uint32_t lo, uint32_t hi);
 static inline int
 mrb_re_charlen(const char *s, const char *end, mrb_bool binary)
 {
-  return binary ? 1 : (int)mrb_enc_charlen(s, end);
+  /* ASCII is answered here: this is asked at every step of a search, and
+     the scan behind mrb_enc_charlen() is a call away. */
+  if (binary || (s < end && (uint8_t)*s < 0x80)) return 1;
+  return (int)mrb_enc_charlen(s, end);
 }
 
 static inline uint32_t

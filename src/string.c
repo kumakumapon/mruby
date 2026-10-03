@@ -6,7 +6,9 @@
 
 #ifdef _MSC_VER
 # define _CRT_NONSTDC_NO_DEPRECATE
-# define WIN32_LEAN_AND_MEAN
+# ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+# endif
 #endif
 
 #include <mruby.h>
@@ -3115,11 +3117,29 @@ mrb_str_intern(mrb_state *mrb, mrb_value self)
  * For strings, it returns the object itself.
  * For symbols, it returns the symbol's name as a string.
  * For integers, it converts the integer to a string (base 10).
- * For classes/modules, it returns their name.
  * For other types, it calls the `to_s` method on the object.
+ *
+ * The line is between a value and an object. A value is spelled by what it
+ * is, and the spelling is written here with the same C function the type's
+ * own `to_s` is, so an override installed on one of those core classes is
+ * not read back -- the way mruby's other C paths over built-ins
+ * (`mrb_cmp()`, the index opcodes before #7198) do not read one either.
+ * Everything else is an object that may answer for itself, a class among
+ * them: `def self.to_s` is a method on one object rather than an override
+ * of a core class, and it is answered here.
  */
 MRB_API mrb_value
 mrb_obj_as_string(mrb_state *mrb, mrb_value obj)
+{
+  mrb_value ret = mrb_obj_as_string_nomethod(mrb, obj);
+  if (mrb_undef_p(ret)) {
+    ret = mrb_type_convert(mrb, obj, MRB_TT_STRING, MRB_SYM(to_s));
+  }
+  return ret;
+}
+
+mrb_value
+mrb_obj_as_string_nomethod(mrb_state *mrb, mrb_value obj)
 {
   switch (mrb_type(obj)) {
   case MRB_TT_STRING:
@@ -3128,12 +3148,20 @@ mrb_obj_as_string(mrb_state *mrb, mrb_value obj)
     return mrb_sym_str(mrb, mrb_symbol(obj));
   case MRB_TT_INTEGER:
     return mrb_integer_to_str(mrb, obj, 10);
-  case MRB_TT_SCLASS:
-  case MRB_TT_CLASS:
-  case MRB_TT_MODULE:
-    return mrb_mod_to_s(mrb, obj);
+#ifdef MRB_USE_BIGINT
+  case MRB_TT_BIGINT:
+    return mrb_bint_to_s(mrb, obj, 10);
+#endif
+#ifndef MRB_NO_FLOAT
+  case MRB_TT_FLOAT:
+    return mrb_flo_to_s(mrb, obj);
+#endif
+  case MRB_TT_FALSE:
+    return mrb_nil_p(obj) ? mrb_nil_to_s(mrb, obj) : mrb_false_to_s(mrb, obj);
+  case MRB_TT_TRUE:
+    return mrb_true_to_s(mrb, obj);
   default:
-    return mrb_type_convert(mrb, obj, MRB_TT_STRING, MRB_SYM(to_s));
+    return mrb_undef_value();
   }
 }
 
@@ -3665,9 +3693,14 @@ mrb_str_len_to_integer(mrb_state *mrb, const char *str, size_t len, mrb_int base
     if (mrb_int_mul_overflow(n, base, &n)) goto overflow;
     if (MRB_INT_MAX - c < n) {
       if (sign == 0 && MRB_INT_MAX - n == c - 1) {
-        n = MRB_INT_MIN;
-        sign = 1;
-        break;
+        /* MRB_INT_MIN fits, if no digit follows (past one '_') */
+        const char *q = (p+1 < pend && p[1] == '_') ? p+2 : p+1;
+        if (q >= pend || conv_digit(*q) < 0 || conv_digit(*q) >= base) {
+          n = MRB_INT_MIN;
+          sign = 1;
+          p++;                  /* past the last digit, for trailingbad() */
+          break;
+        }
       }
     overflow:
 #ifdef MRB_USE_BIGINT
@@ -3675,12 +3708,19 @@ mrb_str_len_to_integer(mrb_state *mrb, const char *str, size_t len, mrb_int base
       const char *p3 = p2;
       while (p3 < pend) {
         char c = TOLOWER(*p3);
+        if (c == '_') {
+          /* "__" ends the number, as in the loop above */
+          if (p3 + 1 < pend && p3[1] == '_') break;
+          p3++;
+          continue;
+        }
         const char *p4 = strchr(mrb_digitmap, c);
-        if (p4 == NULL && c != '_') break;
+        if (p4 == NULL) break;
         if (p4 - mrb_digitmap >= base) break;
         p3++;
       }
-      if (badcheck && trailingbad(str, p, pend)) goto bad;
+      /* p is where the overflow was found, not where the digits end */
+      if (badcheck && trailingbad(str, p3, pend)) goto bad;
       return mrb_bint_new_str(mrb, p2, (mrb_int)(p3-p2), sign ? base : -base);
 #else
       mrb_raisef(mrb, E_RANGE_ERROR, "string (%l) too big for integer", str, pend-str);
@@ -3832,11 +3872,11 @@ mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
 
     if (!badcheck) return 0.0;
     x = mrb_str_len_to_integer(mrb, p, pend-p, 0, badcheck);
-    if (mrb_integer_p(x))
-      d = (double)mrb_integer(x);
-    else /* if (mrb_float_p(x)) */
-      d = mrb_float(x);
-    return d;
+#ifdef MRB_USE_BIGINT
+    if (mrb_bigint_p(x))
+      return mrb_bint_as_float(mrb, x);
+#endif
+    return (double)mrb_integer(x);
   }
   while (p < pend) {
     if (!*p) {

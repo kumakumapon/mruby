@@ -173,6 +173,41 @@ assert 'Bigint -' do
   assert_equal(-36893488147419104229, -997 - n)
 end
 
+assert 'Bigint -/+ keeps the sign when a small operand grows the magnitude' do
+  # A magnitude that is all ones up to a limb boundary carries into a new limb
+  # when 1 is added. Doing that to a negative value used to flip the sign, so
+  # -(2**64 - 1) - 1 answered +2**64 instead of -2**64.
+  n = (1 << 64) - 1
+  assert_equal(-18446744073709551616, -n - 1)
+  assert_equal(-18446744073709551616, -n + -1)
+  assert_equal(-18446744073709551620, -n - 5)
+  assert_equal 18446744073709551616, n + 1
+  m = (1 << 128) - 1
+  assert_equal(-340282366920938463463374607431768211456, -m - 1)
+  assert_equal 340282366920938463463374607431768211456, m + 1
+  assert_equal(-n, (-n - 7) + 7)
+  assert_equal n, (n + 7) - 7
+end
+
+assert 'Bigint * where Toom-3 evaluates a negative value at -1' do
+  # Toom-3 splits an operand into thirds x2, x1, x0 and multiplies at -1 by
+  # x0 - x1 + x2, negated when x1 outweighs the other two. The negation lost
+  # its carry where limbs are 16 bits wide (MRB_NO_MPZ64BIT), so products
+  # like this one came out wrong. N is a multiple of 96, so that with limbs
+  # of either width a third falls at N/3 and the operands are past the Toom-3
+  # threshold; the middle third of `a` is all ones, which makes the value at
+  # -1 negative. `a` is a sum of powers of two, so the product needs no
+  # multiplication to check.
+  n = 3840
+  a = (1 << (n - 1)) + (1 << (2 * n / 3)) - (1 << (n / 3))
+  b = ((7 ** 1400) & ((1 << n) - 1)) | (1 << (n - 1))
+  times_a = ->(v) { (v << (n - 1)) + (v << (2 * n / 3)) - (v << (n / 3)) }
+  assert_equal times_a.(b), a * b
+  assert_equal times_a.(b), b * a
+  assert_equal times_a.(a), a * a
+  assert_equal(-times_a.(b), -a * b)
+end
+
 assert 'Bigint *' do
   n = 1<<65
   assert_equal 0, n * 0
@@ -268,6 +303,30 @@ assert 'Bigint ^' do
   assert_equal(-36893488147419103231, -n ^ 1)
 end
 
+assert 'Bigint ~' do
+  n = 1<<64
+  assert_equal(-18446744073709551617, ~n)
+  assert_equal(-18446744073709551616, ~(n - 1))
+  assert_equal(-1267650600228229401496703205377, ~(1<<100))
+  assert_equal 18446744073709551615, ~(-n)
+  assert_equal 18446744073709551616, ~(-n - 1)
+  assert_equal n, ~~n
+end
+
+assert 'Bigint >> rounds a negative number toward minus infinity' do
+  n = 1<<64
+  assert_equal(-9223372036854775808, -n >> 1)
+  assert_equal(-9223372036854775809, (-n - 1) >> 1)
+  assert_equal(-1, -n >> 64)
+  assert_equal(-2, (-n - 1) >> 64)
+  assert_equal(-2, (-n + 1) >> 63)
+  assert_equal(-1, -n >> 65)
+  assert_equal(-1, -n >> 100)
+  assert_equal(-295147905179352825857, (-(1<<70) - 3) >> 2)
+  assert_equal(-295147905179352825857, (-(1<<70) - 3) << -2)
+  assert_equal 295147905179352825856, ((1<<70) + 3) >> 2
+end
+
 assert 'Bigint to_s' do
   n = 1197857166996989179607278372168909873645893814254642585755536286462800958278984531968
   assert_equal n, "11978_571669_96989179607278372168909873645893814254642585755536286462800958278984531968".to_i
@@ -326,6 +385,26 @@ assert 'Bigint Integer#remainder large operand' do
   assert_equal (3**500) % m, (3**500).remainder(m)
   assert_equal (5**500) % ((2**150) + 1), (5**500).remainder((2**150) + 1)
   assert_equal (2**400) % ((2**130) + 1), (2**400).remainder((2**130) + 1)
+end
+
+assert 'Bigint Integer#remainder takes the sign of the receiver' do
+  n = 1<<70
+  assert_equal 1, n.remainder(3)
+  assert_equal 1, n.remainder(-3)
+  assert_equal(-1, (-n).remainder(3))
+  assert_equal(-1, (-n).remainder(-3))
+  assert_equal 1, (n + 1).remainder(-(1<<65))
+end
+
+assert 'Bigint Integer#pow(e, m) with a negative base or one past m**2' do
+  n = 1<<70
+  assert_equal 6, (-n).pow(3, 7)
+  assert_equal(-1, (-n).pow(3, -7))
+  assert_equal 1180591620717411303181, (-3).pow(5, n)
+  m = (2**300) + 2
+  assert_equal 729, ((2**600) + 5).pow(3, m)
+  assert_equal ((-(2**300) - 12345) ** 3) % m, (-(2**300) - 12345).pow(3, m)
+  assert_equal ((-(2**300) - 12345) ** 3) % (2**300), (-(2**300) - 12345).pow(3, 2**300)
 end
 
 assert 'Bigint Integer#remainder with a non-numeric argument' do
@@ -624,4 +703,22 @@ assert('mrb_integer_to_bytes and mrb_integer_from_bytes') do
 
   assert_raise(TypeError) { BigintTest.to_bytes("1") }
   assert_raise(TypeError) { BigintTest.to_bytes(nil) }
+end
+
+assert('Bigint#remainder and #pow(e, m) with a negative operand and a mid-sized modulus') do
+  # A modulus of 4 to 16 limbs against a dividend up to twice as wide takes
+  # Barrett reduction, which was handed the signed operands: a negative x
+  # came back unreduced, and a positive x over a negative m never returned.
+  # The answers are checked against the quotient division gives, which does
+  # not take that path.
+  xs = [2**600+5, -(2**600+5), 2**400+12345, -(2**400+12345)]
+  ms = [2**300+2, -(2**300+2), 7**100, -(7**100)]
+  xs.each do |x|
+    ms.each do |m|
+      q = x.abs / m.abs
+      q = -q if (x < 0) != (m < 0)
+      assert_equal x - q * m, x.remainder(m), "#{x < 0 ? '-' : '+'}x.remainder(#{m < 0 ? '-' : '+'}m)"
+      assert_equal x - (x / m) * m, x.pow(1, m), "#{x < 0 ? '-' : '+'}x.pow(1, #{m < 0 ? '-' : '+'}m)"
+    end
+  end
 end
