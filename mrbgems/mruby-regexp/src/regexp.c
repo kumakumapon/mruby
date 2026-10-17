@@ -81,6 +81,9 @@ typedef struct {
   mrb_value regexp;        /* Regexp object (for named captures) */
   int *captures;           /* capture positions [start0,end0,start1,end1,...] */
   int num_captures;        /* number of capture groups (including 0) */
+  int attempt;             /* where the attempt that matched began: group 0's
+                              start, unless a \K moved that later; `=~` and
+                              `start_with?` answer from it */
 } mrb_match_data;
 
 static void matchdata_free(mrb_state *mrb, void *ptr) {
@@ -444,6 +447,7 @@ create_matchdata(mrb_state *mrb, mrb_value regexp, mrb_value str, int *captures,
   md->num_captures = ncap / 2;
   md->captures = (int*)(md + 1);
   memcpy(md->captures, captures, sizeof(int) * ncap);
+  md->attempt = captures[0];
   /* Keep `source` and `regexp` GC-reachable via instance variables.
    * The mrb_values are also held in mrb_match_data, but C-allocated
    * structs are not scanned by the GC. */
@@ -498,10 +502,13 @@ exec_match(mrb_state *mrb, mrb_value self, mrb_value str, mrb_int pos,
   mrb_bool binary = re_search_binary(mrb, self, str, unread, &pat);
 
   int cap_size = pat->num_captures * 2;
-  int captures[RE_MAX_CAPTURES * 2];
-  memset(captures, -1, sizeof(int) * cap_size);
+  /* A \K's pair follows the groups, and the engine leaves the start of the
+     attempt there (keep_apply()), so the search runs into room for it. */
+  int exec_size = pat->keep_slot ? pat->keep_slot + 2 : cap_size;
+  int captures[RE_MAX_CAPTURES * 2 + 2];
+  memset(captures, -1, sizeof(int) * exec_size);
   int ncap = mrb_re_exec(mrb, pat, RSTRING_PTR(str), RSTRING_LEN(str), pos,
-                     captures, cap_size, binary);
+                     captures, exec_size, binary);
   re_check_exec_error(mrb, ncap);
 
   if (ncap == 0) {
@@ -511,7 +518,12 @@ exec_match(mrb_state *mrb, mrb_value self, mrb_value str, mrb_int pos,
   /* `literal` says the caller quoted a String pattern into `self` to have
      something to search with. Such a match carries no Regexp in CRuby until
      MatchData#regexp builds one, so the quoted one is not recorded here. */
-  return create_matchdata(mrb, literal ? mrb_nil_value() : self, str, captures, cap_size);
+  mrb_value md = create_matchdata(mrb, literal ? mrb_nil_value() : self, str, captures, cap_size);
+  if (pat->keep_slot) {
+    mrb_match_data *m = DATA_GET_PTR(mrb, md, &matchdata_type, mrb_match_data);
+    m->attempt = captures[pat->keep_slot];
+  }
+  return md;
 }
 
 /*
@@ -654,7 +666,7 @@ regexp_match_op(mrb_state *mrb, mrb_value self)
   if (mrb_nil_p(md)) return mrb_nil_value();
 
   mrb_match_data *m = DATA_GET_PTR(mrb, md, &matchdata_type, mrb_match_data);
-  return mrb_int_value(mrb, re_byte_to_char(mrb, m->source, m->captures[0]));
+  return mrb_int_value(mrb, re_byte_to_char(mrb, m->source, m->attempt));
 }
 
 /*
@@ -1619,6 +1631,90 @@ matchdata_regexp(mrb_state *mrb, mrb_value self)
 }
 
 /*
+ * MatchData#== / #eql? - the same subject, an equal Regexp and the same
+ * positions, which is what CRuby's match_equal() compares. A literal match
+ * is compared through the Regexp MatchData#regexp builds for it.
+ */
+static mrb_value
+matchdata_eql(mrb_state *mrb, mrb_value self)
+{
+  mrb_value other = mrb_get_arg1(mrb);
+
+  if (mrb_obj_eq(mrb, self, other)) return mrb_true_value();
+  if (!mrb_obj_is_kind_of(mrb, other, mrb_class_get_id(mrb, MRB_SYM(MatchData)))) {
+    return mrb_false_value();
+  }
+  mrb_match_data *m1 = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  mrb_match_data *m2 = DATA_GET_PTR(mrb, other, &matchdata_type, mrb_match_data);
+  if (!m1 || !m2) return mrb_false_value();
+  if (m1->num_captures != m2->num_captures) return mrb_false_value();
+  if (memcmp(m1->captures, m2->captures, sizeof(int) * m1->num_captures * 2) != 0) {
+    return mrb_false_value();
+  }
+  if (!mrb_str_equal(mrb, m1->source, m2->source)) return mrb_false_value();
+  /* Regexp#== read directly: the same source and the same flags. */
+  mrb_value re1 = matchdata_regexp(mrb, self);
+  mrb_value re2 = matchdata_regexp(mrb, other);
+  if (mrb_obj_eq(mrb, re1, re2)) return mrb_true_value();
+  if (!mrb_str_equal(mrb, re_check_initialized(mrb, re1), re_check_initialized(mrb, re2))) {
+    return mrb_false_value();
+  }
+  return mrb_bool_value(get_iflags(mrb, re1) == get_iflags(mrb, re2));
+}
+
+/*
+ * MatchData#hash - agrees with #eql?
+ */
+static mrb_value
+matchdata_hash(mrb_state *mrb, mrb_value self)
+{
+  mrb_match_data *md = DATA_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
+  if (!md) return mrb_int_value(mrb, 0);
+  uint32_t h = mrb_str_hash(mrb, md->source);
+  for (int i = 0; i < md->num_captures * 2; i++) {
+    h = h * 31 + (uint32_t)md->captures[i];
+  }
+  /* Regexp#hash mixed in: equal Regexps hash alike. */
+  h ^= (uint32_t)mrb_integer(regexp_hash(mrb, matchdata_regexp(mrb, self)));
+  return mrb_int_value(mrb, (mrb_int)h);
+}
+
+/*
+ * MatchData#initialize_copy - what dup and clone leave the copy holding
+ *
+ * The positions live in a block one object owns, so the copy takes its own
+ * block with the same contents rather than the original's pointer. Without
+ * this the copy had no data and refused every reader as uninitialized.
+ */
+static mrb_value
+matchdata_init_copy(mrb_state *mrb, mrb_value self)
+{
+  mrb_value orig = mrb_get_arg1(mrb);
+
+  if (mrb_obj_eq(mrb, self, orig)) return self;
+  if (mrb_type(self) != mrb_type(orig) || mrb_obj_class(mrb, self) != mrb_obj_class(mrb, orig)) {
+    mrb_raise(mrb, E_TYPE_ERROR, "initialize_copy should take same class object");
+  }
+  mrb_match_data *src = DATA_GET_PTR(mrb, orig, &matchdata_type, mrb_match_data);
+  if (!src) {
+    mrb_raise(mrb, E_TYPE_ERROR, "uninitialized MatchData");
+  }
+
+  size_t len = sizeof(int) * src->num_captures * 2;
+  mrb_match_data *md = (mrb_match_data*)mrb_malloc(mrb, sizeof(mrb_match_data) + len);
+  *md = *src;
+  md->captures = (int*)(md + 1);
+  memcpy(md->captures, src->captures, len);
+  if (DATA_PTR(self)) matchdata_free(mrb, DATA_PTR(self));
+  DATA_PTR(self) = md;
+  DATA_TYPE(self) = &matchdata_type;
+  /* The instance variables are what keep the two values reachable. */
+  mrb_iv_set(mrb, self, MRB_SYM(source), md->source);
+  mrb_iv_set(mrb, self, MRB_SYM(regexp), md->regexp);
+  return self;
+}
+
+/*
  * MatchData#to_s - full match string
  */
 static mrb_value
@@ -1638,9 +1734,9 @@ matchdata_to_s(mrb_state *mrb, mrb_value self)
 static mrb_value
 matchdata_inspect(mrb_state *mrb, mrb_value self)
 {
-  /* dup/clone leave the copy without match data. inspect answers rather than
-     raising, as it does on an uninitialized Regexp, and CRuby's answer for a
-     MatchData with no data is the bare class-and-address form. */
+  /* A MatchData without match data answers rather than raising, as an
+     uninitialized Regexp does, and CRuby's answer for one is the bare
+     class-and-address form. */
   mrb_match_data *md = DATA_CHECK_GET_PTR(mrb, self, &matchdata_type, mrb_match_data);
   if (!md) return mrb_any_to_s(mrb, self);
 
@@ -2656,7 +2752,7 @@ str_match_op_common(mrb_state *mrb, mrb_value str)
     mrb_value md = re_search(mrb, re, str, 0, FALSE);
     if (mrb_nil_p(md)) return mrb_nil_value();
     mrb_match_data *m = DATA_GET_PTR(mrb, md, &matchdata_type, mrb_match_data);
-    return mrb_int_value(mrb, re_byte_to_char(mrb, m->source, m->captures[0]));
+    return mrb_int_value(mrb, re_byte_to_char(mrb, m->source, m->attempt));
   }
   return mrb_funcall_argv(mrb, re, MRB_OPSYM(match), 1, &str);
 }
@@ -3444,7 +3540,7 @@ str_start_with_p(mrb_state *mrb, mrb_value self)
       mrb_value md = re_search(mrb, arg, self, 0, FALSE);
       if (!mrb_nil_p(md)) {
         mrb_match_data *m = DATA_GET_PTR(mrb, md, &matchdata_type, mrb_match_data);
-        if (m->captures[0] == 0) return mrb_true_value();
+        if (m->attempt == 0) return mrb_true_value();
         /* A match further along is not an answer and CRuby leaves none
            behind for one, so clear what the search published. */
         clear_match_globals(mrb);
@@ -3649,6 +3745,10 @@ mrb_mruby_regexp_gem_init(mrb_state *mrb)
   mrb_undef_class_method(mrb, md, "new");
   mrb_undef_class_method(mrb, md, "allocate");
 
+  mrb_define_method(mrb, md, "initialize_copy", matchdata_init_copy, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, md, "==", matchdata_eql, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, md, "eql?", matchdata_eql, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, md, "hash", matchdata_hash, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "[]", matchdata_aref, MRB_ARGS_ARG(1, 1));
   mrb_define_method(mrb, md, "captures", matchdata_captures, MRB_ARGS_NONE());
   mrb_define_method(mrb, md, "to_a", matchdata_to_a, MRB_ARGS_NONE());

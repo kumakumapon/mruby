@@ -145,11 +145,14 @@ enum re_opcode {
                         either takes an end and jumps to `offset`, or runs
                         the body once at the position it stands at and goes
                         on to the next position. */
-  RE_ABSENT_END      /* end of the absent's body, reached where the body
+  RE_ABSENT_END,     /* end of the absent's body, reached where the body
                         matched: the match is not the absent's, it is what
                         says the absent may not reach past it, so the round
                         records how far the absent may still reach and the
                         scan goes on at the next position. */
+  RE_GPOS            /* \G, assert the position this search started from,
+                        which the backtracking engine keeps as
+                        bt_state::gpos; the pattern needs that engine */
 };
 
 /* RE_LOOK_END::a. The polarity says what a matched sub-pattern means. The
@@ -255,6 +258,9 @@ typedef struct mrb_regexp_pattern {
   re_named_capture *named_captures;
   char *named_arena;       /* owned storage for named_captures[i].name; NULL if num_named == 0 */
   uint16_t num_named;
+  uint16_t keep_slot;      /* the even capture slot past the groups
+                              where a \K records its position, or 0 for a
+                              pattern with no \K; see keep_apply() */
   mrb_bool has_backref;    /* true if pattern uses \1-\9 */
   mrb_bool needs_backtrack; /* true if pattern needs backtracking engine */
   uint8_t *prefix;         /* literal prefix bytes for fast skip (or NULL) */

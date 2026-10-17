@@ -255,6 +255,35 @@ assert 'Bigint mod' do
   assert_equal 18446744073709551616, (n / 2) % n
 end
 
+assert 'Integer#div by a Bigint' do
+  n = 1<<65
+  assert_equal 0, 7.div(n)
+  assert_equal(-1, (-7).div(n))
+  assert_equal(-1, 7.div(-n))
+  assert_equal 0, 0.div(n)
+end
+
+assert 'Bigint mod with a Float' do
+  skip unless Object.const_defined?(:Float)
+  n = 1<<65
+  assert_equal 2.0, n % 3.0
+  assert_equal(-1.0, n % -3.0)
+  assert_equal 1.0, -n % 3.0
+  assert_equal(-2.0, -n % -3.0)
+  assert_equal Float::INFINITY, -n % Float::INFINITY
+  assert_raise(ZeroDivisionError) { n % 0.0 }
+end
+
+assert 'Integer#remainder by a Bigint' do
+  n = 1<<65
+  assert_equal 7, 7.remainder(n)
+  assert_equal(-7, (-7).remainder(n))
+  assert_equal 7, 7.remainder(-n)
+  assert_equal 0, 0.remainder(n)
+  assert_equal 9007199254740993, 9007199254740993.remainder(n)
+  assert_kind_of Integer, 7.remainder(n)
+end
+
 assert 'Bigint divmod' do
   n = 1<<65
   assert_equal [37004501652376231, 925], n.divmod(997)
@@ -269,6 +298,18 @@ assert 'Bigint divmod' do
   assert_equal [0, 18446744073709551616], (n / 2).divmod(n)
 end
 
+assert 'Float#divmod with a quotient past fixnum' do
+  skip unless Object.const_defined?(:Float)
+  q, r = (2.0**65).divmod(3.0)
+  assert_kind_of Integer, q
+  assert_equal (2.0**65 / 3.0).floor, q
+  assert_equal 2.0, r
+  q, r = (2**65).divmod(3.0)
+  assert_kind_of Integer, q
+  assert_equal 2.0, r
+  assert_raise(FloatDomainError) { Float::INFINITY.divmod(2.0) }
+end
+
 assert 'Bigint &' do
   n = 1<<65
   assert_equal 0, n & 0
@@ -280,6 +321,15 @@ assert 'Bigint &' do
   assert_equal n, n & n
   assert_equal 36893488147419103232, n & -1
   assert_equal 36893488147419103232, -1 & n
+
+  # A negative value meets the mask as its two's complement: the small-mask
+  # fast path read the magnitude's low limb instead, and the conversion back
+  # from a two's complement lost its carry where the result is exactly
+  # -(2**(limb bits * limbs)), answering 0.
+  assert_equal 16, -(2**128 + 1) & 16
+  assert_equal 23, -(2**64 + 9) & 31
+  assert_equal 0, -(2**64) & 255
+  assert_equal(-(2**128), -(2**127 - 2) & -(2**128 - 1))
 end
 
 assert 'Bigint |' do
@@ -301,6 +351,10 @@ assert 'Bigint ^' do
   assert_equal 0, n ^ n
   assert_equal(-36893488147419103233, n ^ -1)
   assert_equal(-36893488147419103231, -n ^ 1)
+
+  # The carry lost in the conversion back from a two's complement, as in the
+  # Bigint & block above.
+  assert_equal(-(2**128), (2**128 - 5) ^ -5)
 end
 
 assert 'Bigint ~' do
@@ -325,6 +379,37 @@ assert 'Bigint >> rounds a negative number toward minus infinity' do
   assert_equal(-295147905179352825857, (-(1<<70) - 3) >> 2)
   assert_equal(-295147905179352825857, (-(1<<70) - 3) << -2)
   assert_equal 295147905179352825856, ((1<<70) + 3) >> 2
+end
+
+assert 'A shift by a Bigint count moves every bit out' do
+  n = 1<<65
+  assert_equal 0, 5 >> n
+  assert_equal(-1, -5 >> n)
+  assert_equal 0, n >> n
+  assert_equal(-1, -n >> n)
+  assert_equal 0, 5 << -n
+  assert_equal(-1, -5 << -n)
+  assert_equal 0, 0 << n
+  assert_raise(RangeError) { 5 << n }
+  # a Bignum count that an mrb_int can hold is not wider than one
+  assert_equal 4, 8 << BigintTest.unnormalized(-1)
+  assert_equal 4, 8 >> BigintTest.unnormalized(1)
+  assert_equal 16, 8 << BigintTest.unnormalized(1)
+  assert_equal 0, BigintTest.unnormalized(0) << n
+  assert_equal 0, BigintTest.unnormalized(0) >> -n
+end
+
+assert 'Bigint size counts the bytes of the magnitude' do
+  skip unless 1.respond_to?(:size)
+  w = 1.size  # a fixnum's, which a Bignum never answers less than
+  assert_equal 9, (2**64).size
+  assert_equal 9, (-(2**64)).size
+  assert_equal [w, 8].max, (2**64 - 1).size
+  assert_equal 13, (2**100).size
+  assert_equal 10, (256**10 - 1).size
+  assert_equal 20, (256**20 - 1).size
+  assert_equal w, BigintTest.unnormalized(7).size
+  assert_equal w, BigintTest.unnormalized(0).size
 end
 
 assert 'Bigint to_s' do
@@ -606,6 +691,28 @@ assert('Bigint Integer#round breaks a tie away from zero') do
   assert_equal big, (big - 5).round(-1)
   assert_equal(-10000000000000000000000010, (-big - 5).round(-1))
   assert_equal(-big, (-big - 4).round(-1))
+end
+
+assert('Bigint Float#round, #floor and #ceil with a negative ndigits') do
+  skip unless Object.const_defined?(:Float)
+  skip if 1e39.infinite? # MRB_USE_FLOAT32
+  # Float#round answered a Float where the result did not fit in an mrb_int,
+  # and 0 for any ndigits below -17. Rounding the Float itself also left
+  # digits below the requested place: 1e25.floor(-3) kept ...905969664.
+  assert_equal 100000000000000000000, 1e20.round
+  assert_equal 100000000000000000000, 1e20.round(-2)
+  assert_equal 100000000000000000000, 1e20.round(-19)
+  assert_equal 20000000000000000000, 1.5e19.round(-19)
+  assert_equal 5000000000000000000, 4.9e18.round(-18)
+  assert_equal 123456789012345700000, 123456789012345678901.0.round(-5)
+  assert_equal 10 ** 300, 1e300.round(-300)
+  assert_equal(-10 ** 300, -1e300.round(-300))
+  assert_equal 10000000000000000905969000, 1e25.floor(-3)
+  assert_equal 10000000000000000906000000, 1e25.ceil(-6)
+  assert_equal(-10000000000000000906000000, -1e25.floor(-6))
+  assert_equal 10 ** 300, 1e300.floor(-299)
+  assert_equal 11 * 10 ** 299, 1e300.ceil(-299)
+  assert_equal 10 ** 300, 1e300.truncate(-299)
 end
 
 assert('Bigint int64 conversion covers the whole signed 64-bit range') do

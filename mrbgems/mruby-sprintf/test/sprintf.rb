@@ -29,6 +29,23 @@ assert('String#% with the 0 flag and a sign') do
   assert_equal "-1.500  ", "%-08.3f" % -1.5
 end
 
+assert('String#% with the 0 flag and a leading 9') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal "009.5", "%05.1f" % 9.5
+  assert_equal "-009.5", "%06.1f" % -9.5
+  assert_equal "+009.5", "%+06.1f" % 9.5
+  assert_equal "009.50e+00", "%010.2e" % 9.5
+  assert_equal "0099.5", "%06g" % 99.5
+end
+
+assert('String#% %#g of zero keeps the decimal point') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal "0.", "%#.0g" % 0.0
+  assert_equal "0.", "%#.1g" % 0.0
+  assert_equal "  -0.", "%#5.1g" % -0.0
+  assert_equal "0.0", "%#.2g" % 0.0
+end
+
 assert('String#% with inf') do
   skip unless Object.const_defined?(:Float)
   inf = Float::INFINITY
@@ -89,6 +106,70 @@ end
 
 assert("String#% %b") do
   assert_equal("..10115", "%0b5" % -5)
+end
+
+assert("String#% %x, %o and %b of a negative number and with a sign flag") do
+  assert_equal("..F01", "%X" % -255)
+  assert_equal("0X..F01", "%#X" % -255)
+  assert_equal("..1011", "%B" % -5)
+  assert_equal("+FF", "%+X" % 255)
+  assert_equal("-FF", "%+X" % -255)
+  assert_equal("+ff", "%+x" % 255)
+  assert_equal(" 101", "% b" % 5)
+  assert_equal("-10", "% o" % -8)
+end
+
+assert("String#% pads the two's complement of a negative number") do
+  assert_equal("     ..f", "%8x" % -1)
+  assert_equal("..ffffff", "%08x" % -1)
+  assert_equal("..ffffffffff", "%.12x" % -1)
+  assert_equal("   0x..f", "%#8x" % -1)
+  assert_equal("0x..f   ", "%-#8.3x" % -1)
+  assert_equal("0X..FF01", "%#08X" % -255)
+  assert_equal("..770", "%#.5o" % -8)
+  assert_equal("..110   ", "%-8.5B" % -2)
+  assert_equal("..f0", "%.3x" % -16)
+  assert_equal("0x..f0", "%#x" % -16)
+end
+
+assert("String#% %o keeps a leading 1 or 3 digit of a negative number") do
+  assert_equal("..71", "%o" % -7)
+  assert_equal("..710", "%o" % -56)
+  assert_equal("..7177777777", "%o" % -100663297)
+  assert_equal("..70", "%o" % -8)
+  assert_equal("..7", "%o" % -1)
+end
+
+assert("String#% %o keeps other leading digits of a negative big integer") do
+  begin
+    big = 1 << 93
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal("..767777777777777777777777777777770", "%o" % (-big - 8))
+end
+
+assert("String#% %o keeps the sign digits of a big integer's two's complement") do
+  begin
+    big = 3 << 62
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal("..76400000000000000000000", "%o" % -big)
+  assert_equal("..7777776400000000000000000000", "%.30o" % -big)
+end
+
+assert("String#% %d of a big integer with a sign") do
+  k = 70
+  begin
+    big = 1 << k
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal("-00000001180591620717411303424", "%030d" % -big)
+  assert_equal("+1180591620717411303424", "%+d" % big)
+  assert_equal(" 1180591620717411303424", "% d" % big)
+  assert_equal("-0001180591620717411303424", "%.25d" % -big)
 end
 
 assert("String#% %d") do

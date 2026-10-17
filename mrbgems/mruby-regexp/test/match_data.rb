@@ -158,10 +158,37 @@ assert("MatchData#inspect - a match a literal String pattern made") do
   assert_equal '#<MatchData "ab">', $~.inspect
 end
 
-assert("MatchData#inspect - a copy without match data") do
-  # dup does not carry the match over, and inspect answers about the object
-  # it has rather than raising as the other readers do
-  assert_true /a/.match("a").dup.inspect.start_with?("#<MatchData:")
+assert("MatchData#==, #eql? and #hash") do
+  a = /(a)(b)?/.match("zab")
+  b = /(a)(b)?/.match("zab")
+  assert_true a == b
+  assert_true a.eql?(b)
+  assert_equal a.hash, b.hash
+  assert_true a == /(a)(b)?/.match("zab", 1)
+  assert_false a == /(a)(b)?/.match("yab")
+  assert_false a == /(a)(b)?/i.match("zab")
+  assert_false a == /(a)(b)/.match("zab")
+  assert_false a == 1
+  assert_true a == a.dup
+  "ab".sub("ab") { }
+  lit = $~
+  "ab".sub(/ab/) { }
+  assert_true lit == $~
+  assert_equal lit.hash, $~.hash
+end
+
+assert("MatchData#dup and #clone carry the match") do
+  m = /(a)(?<x>b)?/.match("zab")
+  [m.dup, m.clone].each do |d|
+    assert_equal '#<MatchData "ab" x:"b">', d.inspect
+    assert_equal ["ab", "b"], d.to_a
+    assert_equal "z", d.pre_match
+    assert_equal "b", d[:x]
+    assert_equal 1, d.begin(0)
+  end
+  l = "zab".match("ab")
+  assert_equal "ab", l.dup[0]
+  assert_equal(/ab/, l.dup.regexp)
 end
 
 assert("MatchData#begin / #end") do

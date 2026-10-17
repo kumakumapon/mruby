@@ -4279,6 +4279,12 @@ mpz_and(mpz_ctx_t *ctx, mpz_t *z, mpz_t *x, mpz_t *y)
     if (z->sn < 0) make_2comp(zv, c3);
     z->p[i] = zv;
   }
+  /* a carry that ran through every limb takes one more from the sign bits
+     above: the result is -(DIG_BASE**max_sz) */
+  if (z->sn < 0 && c3) {
+    mpz_realloc(ctx, z, max_sz+1);
+    z->p[max_sz] = 1;
+  }
   trim(z);
 }
 
@@ -4335,6 +4341,12 @@ mpz_or(mpz_ctx_t *ctx, mpz_t *z, mpz_t *x, mpz_t *y)
     if (z->sn < 0) make_2comp(zv, c3);
     z->p[i] = zv;
   }
+  /* as in mpz_and(); with trimmed operands an OR cannot leave every limb
+     zero, but the three walks stay alike */
+  if (z->sn < 0 && c3) {
+    mpz_realloc(ctx, z, max_sz+1);
+    z->p[max_sz] = 1;
+  }
   trim(z);
 }
 
@@ -4390,6 +4402,11 @@ mpz_xor(mpz_ctx_t *ctx, mpz_t *z, mpz_t *x, mpz_t *y)
     mp_limb zv = xv ^ yv;
     if (z->sn < 0) make_2comp(zv, c3);
     z->p[i] = zv;
+  }
+  /* as in mpz_and() */
+  if (z->sn < 0 && c3) {
+    mpz_realloc(ctx, z, max_sz+1);
+    z->p[max_sz] = 1;
   }
   trim(z);
 }
@@ -6022,7 +6039,12 @@ mrb_bint_and(mrb_state *mrb, mrb_value x, mrb_value y)
     mrb_int z = mrb_integer(y);
     if (z == 0) return mrb_fixnum_value(0);
     if (z > 0 && (mp_dbl_limb)z < DIG_BASE) {
-      z &= a.p[0];
+      mp_limb v = a.p[0];
+      /* a negative value meets the mask as its two's complement; only the
+         lowest limb can reach z, and its complement is ~p[0]+1 with nothing
+         below to carry in */
+      if (a.sn < 0) v = ~v + 1;
+      z &= v;
       return mrb_int_value(mrb, z);
     }
     if (z == -1) return x;
@@ -6237,6 +6259,22 @@ mrb_bint_sign(mrb_state *mrb, mrb_value bint)
   return RBIGINT_SIGN(RBIGINT(bint));
 }
 
+/* The bytes of the magnitude, which is what CRuby's Integer#size answers
+   for a Bignum: -(2**64) takes 9, where its two's-complement bit length
+   (64) would make it 8. */
+size_t
+mrb_bint_abs_bytes(mrb_value x)
+{
+  mpz_t z;
+  bint_as_mpz(RBIGINT(x), &z);
+  size_t n = z.sz;
+  while (n > 0 && z.p[n-1] == 0) n--;
+  if (n == 0) return 0;
+  int top = 0;
+  for (mp_limb t = z.p[n-1]; t; t >>= 1) top++;
+  return ((n - 1) * DIG_SIZE + top + 7) / 8;
+}
+
 mrb_int
 mrb_bint_bytes_size(mrb_state *mrb, mrb_value bint)
 {
@@ -6282,7 +6320,7 @@ mrb_bint_2comp(mrb_state *mrb, mrb_value x)
   mpz_init(ctx, &z);
   mrb_assert(a.sn < 0);
   size_t size = a.sz;
-  mpz_realloc(ctx, &z, size);
+  mpz_realloc(ctx, &z, size+1);
   mp_limb *ds = a.p;
   mp_limb *dd = z.p;
   char carry = 1;
@@ -6291,6 +6329,8 @@ mrb_bint_2comp(mrb_state *mrb, mrb_value x)
     make_2comp(xv, carry);
     dd[i] = xv;
   }
+  /* a limb of sign bits keeps the leading zeros of the complement */
+  dd[size] = ~(mp_limb)0;
   z.sn = 1;
 
   struct RBigint *b2 = bint_new(ctx, &z);
