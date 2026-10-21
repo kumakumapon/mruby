@@ -1162,6 +1162,117 @@ assert('Array#intersection narrows by every argument, not by their union') do
   assert_equal [1, 2], a.intersection([1, 2, 3])
 end
 
+assert('Array#intersection result shrunk from an element #hash') do
+  # From the second argument on, the result is narrowed in place. Each
+  # membership test runs the element's #hash, which is Ruby and can reach the
+  # result and shrink its buffer, so the next in-place write used to land past
+  # the allocation (GHSA-2q37-c36g-7hqw). The write position is bounded by the
+  # result's current length now, so a shrink just stops the narrowing early.
+  #
+  # The receiver and the two arguments hold distinct objects of equal value,
+  # so only the result array carries the receiver's own objects: it is the one
+  # array holding a[0] that is not the receiver itself. hash on the element of
+  # value 8 fires four times over two arguments -- once building each
+  # argument's set, once scanning the receiver, once scanning the result --
+  # and the fourth is the in-place pass, where write_pos has reached 8. There
+  # the result is cleared and refilled small, which reallocates its buffer to
+  # a capacity of 8; the unfixed write then stored to index 8.
+  skip unless Object.const_defined?(:ObjectSpace)
+  trap = Class.new do
+    class << self; attr_accessor :a0, :a_ref, :count; end
+    define_method(:initialize) { |n| @n = n }
+    attr_reader :n
+    define_method(:hash) do
+      cls = self.class
+      if @n == 8
+        cls.count += 1
+        if cls.count == 4
+          ObjectSpace.each_object(Array) do |o|
+            next if o.equal?(cls.a_ref)
+            next if o.size != 20 || !o[0].equal?(cls.a0)
+            o.clear
+            o.concat([1, 2, 3, 4, 5])
+            break
+          end
+        end
+      end
+      @n
+    end
+    define_method(:eql?) { |o| o.is_a?(self.class) && o.n == @n }
+    define_method(:==) { |o| eql?(o) }
+  end
+  a = (0...20).map { |n| trap.new(n) }
+  b = (0...20).map { |n| trap.new(n) }
+  c = (0...20).map { |n| trap.new(n) }
+  trap.a0 = a[0]
+  trap.a_ref = a
+  trap.count = 0
+  # Must not overflow; the result holds whatever the shrink left reachable.
+  assert_true a.intersection(b, c).size <= a.size
+end
+
+assert('Array set operations keep keys reachable from #hash alive') do
+  # Above 8 elements per side, the set operations hold their keys in a khash
+  # the GC does not mark. Those keys used to be pinned only by Ruby-visible
+  # arrays -- shared copies of the arguments, or the union's result -- so an
+  # element's #hash could reach them through ObjectSpace, empty them and run
+  # GC, leaving the next set probe to read a freed object (GHSA-xp9g-4qj8-x3c4).
+  # The copies are hidden from ObjectSpace now, and the union is handed the
+  # receiver and arguments to pin the same way, so clearing what the script
+  # can see no longer frees a live key. Under AddressSanitizer the unfixed
+  # code faults in the probe; here each operation must run to a valid answer.
+  skip unless Object.const_defined?(:ObjectSpace)
+  n = 4096
+  key = Class.new do
+    def initialize(v, trig)
+      @v = v
+      @trig = trig
+    end
+    attr_reader :v
+    def hash
+      if @trig && !$ary_setop_freed
+        $ary_setop_freed = true
+        ObjectSpace.each_object(Array) { |o| o.clear if o.size == 4096 }
+        GC.start
+        ObjectSpace.each_object(Integer) { } # run the sweep to completion
+      end
+      @v
+    end
+    def eql?(o)
+      o.is_a?(self.class) && o.v == @v
+    end
+    def ==(o)
+      eql?(o)
+    end
+  end
+  # Each operation gets a fresh argument of 4096 heap keys (the khash points
+  # at these) and a 9-element receiver whose elements carry the trigger and
+  # are probed after the set is built from the argument. The trigger clears
+  # the argument once, so it is rebuilt for each operation. difference and
+  # intersection both probe the receiver against a set of the argument's
+  # elements, which is where the freed key was read.
+  setup = lambda do
+    $ary_setop_freed = false
+    [(0...9).map { |i| key.new(i, true) }, (0...n).map { |i| key.new(i % 9, false) }]
+  end
+  recv, arg = setup.call
+  assert_equal [], recv.difference(arg)      # every value 0..8 is in arg
+  recv, arg = setup.call
+  assert_equal recv.size, recv.intersection(arg).size
+end
+
+assert('Array#union over the hash threshold keeps every distinct element') do
+  # union now hands the receiver and arguments to the membership object so
+  # its hidden copies pin the keys (GHSA-xp9g-4qj8-x3c4); this checks the
+  # ordinary answer is unchanged by that, above and below the set threshold.
+  a = (1..20).to_a
+  b = (15..34).to_a
+  assert_equal (1..34).to_a, a.union(b)
+  assert_equal (1..34).to_a, a | b
+  assert_equal [1, 2, 3, 4], [1, 2, 2].union([3, 3, 4])
+  assert_equal (1..40).to_a, (1..20).to_a.union((10..30).to_a, (21..40).to_a)
+end
+
 assert('Array#intersection with no argument copies the receiver') do
   # Nothing to narrow by, so every element survives. An empty Array was
   # answered instead, which is what narrowing by nothing at all would give.

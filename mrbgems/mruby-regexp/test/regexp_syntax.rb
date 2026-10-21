@@ -3381,26 +3381,32 @@ assert("Regexp - \\h and \\H hex-digit shorthands") do
   assert_equal ["deadBEEF"], "deadBEEFzz".scan(/\h+/)
 end
 
-assert("Regexp - pattern too large for its jump targets is refused") do
-  # Jump targets live in a 16-bit field, so a program that outgrows the field
-  # used to wrap them and jump to an unrelated instruction: the pattern then
-  # quietly stopped matching text it describes instead of reporting anything.
-  # Each (?:abc) unit costs three instructions and the bound is on the whole
-  # program, so the two counts below sit either side of it.
-  assert_kind_of Regexp, Regexp.new("(?:abc){21844}")
-  assert_raise_with_message(RegexpError, "regexp too large: /(?:abc){21845}/") do
-    Regexp.new("(?:abc){21845}")
-  end
+assert("Regexp - a program past 16-bit jump targets matches") do
+  # Jump targets used to live in a 16-bit field, and a program that outgrew
+  # it was refused as too large; before that was checked, the targets wrapped
+  # and the pattern quietly stopped matching text it describes. The field is
+  # 32 bits now. Each (?:abc) unit costs three instructions, so these
+  # programs reach past 65535 of them, and each still matches what it says.
+  # Every pattern is anchored: a search free to start anywhere runs a thread
+  # from each offset through the whole program, which takes about a minute.
+  re = Regexp.new("\\A(?:abc){21845}")
+  assert_equal 0, re =~ "abc" * 21845
+  assert_nil re =~ "abc" * 21844
 
-  # the shapes that used to answer wrongly rather than raise: a quantifier
-  # whose skip target is patched past the bound, and an alternation whose
-  # branch and exit targets both wrap
-  assert_raise(RegexpError) { Regexp.new("(?:abc){21844}x*y") }
-  assert_raise(RegexpError) { Regexp.new("(?:abc){30000}(?:y|z)") }
+  # the shapes that used to answer wrongly: a quantifier whose skip target
+  # lies past the old bound, and an alternation whose branch and exit
+  # targets both do
+  re = Regexp.new("\\A(?:abc){21844}x*y")
+  assert_equal 0, re =~ "abc" * 21844 + "xxy"
+  assert_equal 0, re =~ "abc" * 21844 + "y"
+  re = Regexp.new("\\A(?:abc){30000}(?:y|z)")
+  assert_equal 0, re =~ "abc" * 30000 + "z"
+  assert_nil re =~ "abc" * 30000 + "w"
 
-  # a quantifier the parser still accepts reaches the bound on its own once
-  # the repeated atom costs more than one instruction
-  assert_raise(RegexpError) { Regexp.new("(?:ab){32768}") }
+  # a quantifier of an atom costing more than one instruction
+  re = Regexp.new("\\A(?:ab){32768}")
+  assert_equal 0, re =~ "ab" * 32768
+  assert_nil re =~ "ab" * 32767
 end
 
 assert("Regexp - a character property escape is read, not taken as letters") do
@@ -3550,10 +3556,10 @@ end
 
 assert("Regexp - the escapes this engine does not carry are refused") do
   # Each means something in CRuby that this engine does not do, and as an
-  # unknown escape each was simply its own letter: /\R/ matched an R rather
-  # than a newline.
-  assert_raise_with_message(RegexpError, "\\R is not supported: /\\R/") { Regexp.new("\\R") }
-  ["\\R", "\\X", "x\\X"].each do |src|
+  # unknown escape each was simply its own letter: /\X/ matched an X rather
+  # than a grapheme cluster. (\R was one of them; it is carried now.)
+  assert_raise_with_message(RegexpError, "\\X is not supported: /\\X/") { Regexp.new("\\X") }
+  ["\\X", "x\\X"].each do |src|
     assert_raise(RegexpError, src) { Regexp.new(src) }
   end
   # \K is carried, but not inside a lookaround or an absent operator, nor
@@ -3696,13 +3702,12 @@ assert("Regexp - what bounds the classes a pattern nests is a table, not a stack
   # group is, so how deep one may nest is a matter of what the compiler holds
   # a level in and not of the C stack the build gets. Two things bound it and
   # the shallower answers: every level open holds an entry in the class table
-  # while it is open, 256 of which there are, and every level but the
+  # while it is open, 65535 of which there are, and every level but the
   # outermost counts against MRB_REGEXP_PARSE_DEPTH_LIMIT beside the levels
   # the pattern itself has open, of which there is one here. So a build at
-  # the default limit nests 256 classes and is told `too many character
-  # classes` at the 257th, and a build that sets the limit at or below that
-  # meets its own limit there instead.
-  deep = 256
+  # the default limit meets that limit first, and only a build that sets it
+  # past the table is told `too many character classes` at the 65536th.
+  deep = 65535
   refusal = "too many character classes"
   if Regexp::PARSE_DEPTH_LIMIT <= deep
     deep = Regexp::PARSE_DEPTH_LIMIT

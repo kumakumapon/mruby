@@ -1,6 +1,7 @@
 #include <mruby.h>
 #include <mruby/range.h>
 #include <mruby/class.h>
+#include <mruby/numeric.h>
 #include <mruby/internal.h>
 
 static mrb_bool
@@ -94,6 +95,56 @@ range_cover(mrb_state *mrb, mrb_value range)
   return mrb_false_value();
 }
 
+/* An endpoint this gem counts in Integer arithmetic: an inline Integer, or a
+   bigint where mrb_int is too narrow to hold the value (a 2**62 endpoint on a
+   32-bit build, say).  mrb_bigint_p() is defined either way and is false
+   without the gem, so the macro reads as plain mrb_integer_p() there. */
+#ifdef MRB_USE_BIGINT
+#define RANGE_INT_P(v) (mrb_integer_p(v) || mrb_bigint_p(v))
+#else
+#define RANGE_INT_P(v) mrb_integer_p(v)
+#endif
+
+/* Sign of (x - y) for two RANGE_INT_P values, without doing the subtraction:
+   an empty range must answer 0 rather than overflow on its span. */
+static mrb_int
+range_int_cmp(mrb_state *mrb, mrb_value x, mrb_value y)
+{
+#ifdef MRB_USE_BIGINT
+  if (mrb_bigint_p(x)) return mrb_bint_cmp(mrb, x, y);
+  if (mrb_bigint_p(y)) return -mrb_bint_cmp(mrb, y, x);
+#endif
+  mrb_int a = mrb_integer(x);
+  mrb_int b = mrb_integer(y);
+  return (a > b) - (a < b);
+}
+
+/* The size of a range with two Integer endpoints, counted exactly.  The span,
+   or an endpoint itself where mrb_int is too narrow, can pass MRB_INT_MAX, so
+   the count is a bigint once it does, or a RangeError without the gem. */
+static mrb_value
+range_int_size(mrb_state *mrb, mrb_value beg, mrb_value end, mrb_bool excl)
+{
+  mrb_int cmp = range_int_cmp(mrb, end, beg);
+  if (cmp < 0 || (excl && cmp == 0)) return mrb_fixnum_value(0);
+
+  mrb_value size;
+#ifdef MRB_USE_BIGINT
+  if (mrb_bigint_p(beg) || mrb_bigint_p(end)) {
+    mrb_value b = mrb_bigint_p(beg) ? beg : mrb_bint_new_int(mrb, mrb_integer(beg));
+    mrb_value e = mrb_bigint_p(end) ? end : mrb_bint_new_int(mrb, mrb_integer(end));
+    size = mrb_bint_sub(mrb, e, b);
+  }
+  else
+#endif
+    size = mrb_int_sub(mrb, end, beg);
+  if (excl) return size;
+#ifdef MRB_USE_BIGINT
+  if (mrb_bigint_p(size)) return mrb_bint_add(mrb, size, mrb_fixnum_value(1));
+#endif
+  return mrb_int_add(mrb, size, mrb_fixnum_value(1));
+}
+
 /*
  *  call-seq:
  *     rng.size                   -> num
@@ -126,6 +177,10 @@ range_size(mrb_state *mrb, mrb_value range)
   mrb_bool excl = RANGE_EXCL(r);
   mrb_float beg_f, end_f;
   mrb_bool num_p = TRUE;
+
+  if (RANGE_INT_P(beg) && RANGE_INT_P(end)) {
+    return range_int_size(mrb, beg, end, excl);
+  }
 
   if (mrb_integer_p(beg)) {
     beg_f = (mrb_float)mrb_integer(beg);
@@ -163,7 +218,7 @@ range_size(mrb_state *mrb, mrb_value range)
     }
     if (isinf(n+1))
       return mrb_float_value(mrb, INFINITY);
-    return mrb_fixnum_value((mrb_int)n+1);
+    return mrb_float_to_integer(mrb, mrb_float_value(mrb, n+1));
   }
   return mrb_nil_value();
 }
@@ -182,13 +237,8 @@ range_size(mrb_state *mrb, mrb_value range)
     return mrb_nil_value();
   }
 
-  mrb_int excl = RANGE_EXCL(r) ? 0 : 1;
-  if (mrb_integer_p(beg) && mrb_integer_p(end)) {
-    mrb_int a = mrb_integer(beg);
-    mrb_int b = mrb_integer(end);
-    mrb_int c = b - a + excl;
-
-    return mrb_int_value(mrb, c);
+  if (RANGE_INT_P(beg) && RANGE_INT_P(end)) {
+    return range_int_size(mrb, beg, end, RANGE_EXCL(r));
   }
   return mrb_nil_value();
 }
